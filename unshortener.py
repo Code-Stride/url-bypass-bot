@@ -86,6 +86,11 @@ NOISE_DOMAINS = {
     "llvpn.com", "adl-media.com", "amung.us", "statcounter.com",
     "histats.com", "hitcounter.com", "clicky.com", "zopim.com",
     "tawk.to", "intercom.io", "crisp.chat", "livechatinc.com",
+    # anti-adblock / "please disable adblocker" landing pages — never a
+    # real destination, they are navigation/help links injected by trackers.
+    "antiblock.org", "adblockplus.org", "adblock.com", "getadblock.com",
+    "ublock.org", "ublockorigin.com", "ghostery.com", "adguard.com",
+    "nothanks.com", "blockadblock.com", "fuckadblock.site",
 }
 
 _LINK_RE = re.compile(
@@ -100,6 +105,21 @@ _SCRIPT_URL_RE = re.compile(
     r"""["']((?:https?://)[^"'\s<>]{4,})["']""",
     re.IGNORECASE,
 )
+
+# --- Link-protection "unlock" form handling --------------------------------
+# Many link-protection sites (mobilejsr.com and friends) hide the real links
+# behind a <form method="post"> that must be submitted together with a hidden
+# CSRF token.  The token is tied to the PHP session cookie, so we must GET the
+# page first (which plants the cookie) and then POST the form back.
+_FORM_BLOCK_RE = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.IGNORECASE | re.DOTALL)
+_HIDDEN_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+_NAME_RE = re.compile(r"""name\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_VALUE_RE = re.compile(r"""value\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+_ACTION_RE = re.compile(r"""action\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+_CSRF_NAMES = {
+    "_csrf", "csrf", "csrf_token", "csrftoken", "csrfToken", "token",
+    "_token", "__requestverificationtoken", "authenticity_token",
+}
 
 _session = requests.Session()
 
@@ -152,6 +172,52 @@ def _is_noise(url: str) -> bool:
         if h == d or h.endswith("." + d):
             return True
     return False
+
+
+def _try_csrf_unlock(final_url: str, html: str) -> str | None:
+    """
+    If the page is a link-protection "unlock" page, find its POST form and
+    submit it (with the hidden CSRF token + session cookie) to reveal the
+    real links.  Returns the unlocked HTML on success, else None.
+    """
+    for m in _FORM_BLOCK_RE.finditer(html):
+        open_tag = m.group(1)
+        inner = m.group(2)
+        if "post" not in open_tag.lower():
+            continue
+
+        am = _ACTION_RE.search(open_tag)
+        action = urljoin(final_url, _html.unescape(am.group(1))) if am else final_url
+
+        data: dict[str, str] = {}
+        has_csrf = False
+        for inp in _HIDDEN_RE.findall(inner):
+            nm = _NAME_RE.search(inp)
+            if not nm:
+                continue
+            name = _html.unescape(nm.group(1))
+            vm = _VALUE_RE.search(inp)
+            value = _html.unescape(vm.group(1)) if vm else ""
+            data[name] = value
+            if name.lower() in _CSRF_NAMES:
+                has_csrf = True
+
+        if not has_csrf:
+            continue
+
+        try:
+            resp = _session.post(
+                action,
+                data=data,
+                headers={**HEADERS, "Referer": final_url},
+                timeout=TIMEOUT,
+                allow_redirects=True,
+            )
+        except requests.RequestException:
+            continue
+        if resp.ok and resp.text:
+            return resp.text
+    return None
 
 
 def _extract_candidates(html: str, base_url: str, own_host: str) -> list[str]:
@@ -230,9 +296,17 @@ def resolve(url: str, depth: int = 0, seen: set[str] | None = None) -> list[str]
 
     # A cross-host HTTP redirect means the shortener bounced us straight to
     # the real destination (e.g. bit.ly -> example.com).  Treat that as the
-    # answer, UNLESS the target is itself a known shortener / protection page.
+    # answer, UNLESS the target is itself a known shortener / protection page
+    # or a known noise/ad domain.
     if _host(final_url) != own_host and not _is_shortener(final_url):
+        if _is_noise(final_url):
+            return []
         return [final_url]
+
+    # Link-protection "unlock" form (POST + CSRF) -> reveals the real links.
+    unlocked = _try_csrf_unlock(final_url, html)
+    if unlocked:
+        html = unlocked
 
     candidates = _extract_candidates(html, final_url, own_host)
     results: list[str] = []
