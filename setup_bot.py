@@ -21,7 +21,7 @@ import urllib.request
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-NAME = os.environ.get("BOT_NAME", "URL Bypass Bot")
+NAME = os.environ.get("BOT_NAME", "BypassBot")
 DESCRIPTION = os.environ.get(
     "BOT_DESCRIPTION",
     "Unshorten any shortened or ad-protected link instantly — no ads, "

@@ -43,7 +43,7 @@ URL_RE = re.compile(r"https?://[^\s<>()\"]+[^\s<>()\".!?,;:]")
 MAX_LINKS_PER_MESSAGE = 5
 
 WELCOME = (
-    "👋 <b>URL Bypass Bot</b>\n\n"
+    "👋 <b>BypassBot</b>\n\n"
     "I unshorten any shortened / ad-protected link and give you the real "
     "destination — no ads, no captcha, no waiting.\n\n"
     "👉 Just send me a link, or use:\n"
