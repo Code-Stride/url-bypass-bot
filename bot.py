@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 
-from unshortener import unshorten
+from unshortener import pick_best, unshorten
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -61,13 +61,16 @@ def format_results(url: str, results: list[str]) -> str:
         )
     if len(results) == 1:
         return f"✅ <b>Unshortened:</b>\n\n{results[0]}"
-    lines = [f"✅ <b>Found {len(results)} links:</b>", ""]
-    for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {r}")
-    return "\n".join(lines)
+
+    best = pick_best(results)
+    note = (
+        f"🎯 <b>Link ({len(results)} mirrors, best one shown):</b>\n\n{best}\n\n"
+        f"Send /all to list every mirror."
+    )
+    return note
 
 
-async def _resolve_and_reply(url: str, reply) -> None:
+async def _resolve_and_reply(url: str, reply, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         # resolve() is blocking network I/O — run it off the event loop.
         res = await asyncio.to_thread(unshorten, url)
@@ -75,6 +78,9 @@ async def _resolve_and_reply(url: str, reply) -> None:
         logger.exception("resolve failed for %s", url)
         await reply(f"⚠️ Something went wrong resolving:\n{url}\n\nError: {exc}")
         return
+
+    context.chat_data["last_results"] = res["results"]
+    context.chat_data["last_input"] = url
 
     text = format_results(url, res["results"])
     await reply(text, parse_mode="HTML", disable_web_page_preview=False)
@@ -97,7 +103,7 @@ async def unshort_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
     status = await update.message.reply_text(f"🔍 Resolving <code>{urls[0]}</code>…", parse_mode="HTML")
-    await _resolve_and_reply(urls[0], status.edit_text)
+    await _resolve_and_reply(urls[0], status.edit_text, context)
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -109,7 +115,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     for url in urls[:MAX_LINKS_PER_MESSAGE]:
         status = await update.message.reply_text(f"🔍 Resolving <code>{url}</code>…", parse_mode="HTML")
-        await _resolve_and_reply(url, status.edit_text)
+        await _resolve_and_reply(url, status.edit_text, context)
+
+
+async def all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List every mirror of the most recently resolved link."""
+    results = context.chat_data.get("last_results")
+    if not results:
+        await update.message.reply_html("ℹ️ No recent link. Send me a link first.")
+        return
+    lines = [f"✅ <b>All {len(results)} links:</b>", ""]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r}")
+    await update.message.reply_html("\n".join(lines))
 
 
 def build_app() -> Application:
@@ -118,6 +136,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("unshort", unshort_cmd))
     app.add_handler(CommandHandler("u", unshort_cmd))
+    app.add_handler(CommandHandler("all", all_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     return app
 

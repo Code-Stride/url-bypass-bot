@@ -506,3 +506,67 @@ def unshorten(url: str) -> dict:
         }
     except Exception as exc:  # noqa: BLE001 - report any failure gracefully
         return {"ok": False, "input": url, "results": [], "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# "Best link" selection — when a protected link fans out into many mirrors,
+# pick the single most accurate / reliable one.
+# ---------------------------------------------------------------------------
+_FILE_EXT_RE = re.compile(
+    r"\.(mkv|mp4|avi|mov|wmv|flv|mk3d|ts|mp3|flac|m4a|wav|ogg|aac|"
+    r"zip|rar|7z|gz|tar|apk|xapk|exe|iso|img|pdf|epub|mobi|cbz|torrent)"
+    r"(?=[?/&#]|$)",
+    re.IGNORECASE,
+)
+
+# Preference score per host (higher = more reliable / more direct a file host).
+_HOST_PREF = {
+    "mediafire.com": 100,
+    "megaup.net": 96,
+    "1fichier.com": 94,
+    "gofile.io": 92,
+    "multiup.io": 90,
+    "mega.nz": 90,
+    "clicknupload.com": 86,
+    "clicknupload.cam": 86,
+    "uploadflix.com": 82,
+    "direct-cloud.top": 82,
+    "hubcloud.cx": 80,
+    "hubcloud.foo": 80,
+    "hubdrive.space": 80,
+    "gdflix.io": 80,
+    "filepress.wiki": 78,
+    "uploadhub.dad": 76,
+    "vikingfile.com": 74,
+    "send.now": 72,
+    "frdl.io": 72,
+}
+
+# Streaming / watch-online hosts — valid content but not a "file" download.
+_STREAM_HOSTS = {
+    "streamtape.com", "streamtape.to", "streamtape.net",
+    "voe.sx", "dood.watch", "dood.so", "dood.to", "luluvdo.com",
+    "mixdrop.co", "mixdrop.to", "filemoon.sx", "filelions.to", "wolfstream.tv",
+}
+
+
+def pick_best(results: list[str]) -> str | None:
+    """Choose the single most accurate/reliable link from a set of mirrors."""
+    if not results:
+        return None
+    if len(results) == 1:
+        return results[0]
+
+    def score(url: str) -> tuple[int, int, str]:
+        h = _host(url)
+        p = urlparse(url)
+        s = _HOST_PREF.get(h, 50)
+        # A real filename in the path is the strongest signal of "the file".
+        if _FILE_EXT_RE.search(p.path):
+            s += 60
+        if h in _STREAM_HOSTS:
+            s -= 25
+        # Shorter, cleaner URLs preferred as tie-breakers.
+        return (s, -len(url), url)
+
+    return max(results, key=score)
