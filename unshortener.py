@@ -15,9 +15,10 @@ How it works (layered strategy):
 
 from __future__ import annotations
 
+import base64
 import html as _html
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 
@@ -64,6 +65,9 @@ KNOWN_SHORTENERS = {
     "tutorialslink.com", "linkrex.net", "earnvisits.com", "clicksfly.com",
     "smoner.com", "openget.net", "themefiles.net", "filelink.org",
     "cpmlink.net", "skmurl.com", "clkmein.com", "cobrabirla.com",
+    # SafelinkU / khaddavi monetization family
+    "sfl.gl", "safelinku.com", "safelinku.net", "safelinku.org",
+    "khaddavi.net", "app.khaddavi.net", "litetekno.com",
 }
 
 # Domains that are never the real destination (ad networks, trackers, cdn).
@@ -103,6 +107,13 @@ _META_REFRESH_RE = re.compile(
 )
 _SCRIPT_URL_RE = re.compile(
     r"""["']((?:https?://)[^"'\s<>]{4,})["']""",
+    re.IGNORECASE,
+)
+
+# JS redirects that reveal a destination directly in the page source, e.g.:
+#   window.location.href = "https:\/\/...";  location.replace("...");
+_JS_REDIRECT_RE = re.compile(
+    r"""(?:window\.)?location\.(?:href|replace|assign)\s*=\s*["']([^"']+)["']""",
     re.IGNORECASE,
 )
 
@@ -172,6 +183,155 @@ def _is_noise(url: str) -> bool:
         if h == d or h.endswith("." + d):
             return True
     return False
+
+
+# --- SafelinkU (sfl.gl) / khaddavi redirect-chain bypass -------------------
+# These links hide the destination behind a multi-step monetization flow
+# (device fingerprinting, timers, captcha).  The final hop is a page at
+# /ready/go?t=<b64 ray_id>&a=<b64 alias> that embeds the real URL directly in
+# its JS (window.location.href = "...").  That link is only "activated" after
+# the khaddavi API flow (session -> verify -> go), which we drive directly.
+SAFELINK_HOSTS = {
+    "sfl.gl", "safelinku.com", "safelinku.net", "safelinku.org",
+    "app.khaddavi.net", "khaddavi.net",
+}
+
+_FORM_ACTION_RE = re.compile(
+    r"""<form\b[^>]*\baction\s*=\s*["']([^"']+)["'][^>]*>""",
+    re.IGNORECASE,
+)
+
+
+def _b64url(s: str) -> str:
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+
+def _form_hidden_fields(html: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for inp in _HIDDEN_RE.findall(html):
+        nm = _NAME_RE.search(inp)
+        if not nm:
+            continue
+        vm = _VALUE_RE.search(inp)
+        name = _html.unescape(nm.group(1)).lower()
+        fields[name] = _html.unescape(vm.group(1)) if vm else ""
+    return fields
+
+
+def _js_redirect_target(html: str) -> str | None:
+    for m in _JS_REDIRECT_RE.finditer(html):
+        dest = m.group(1).replace("\\/", "/").strip()
+        if dest.startswith(("http://", "https://")):
+            return dest
+    return None
+
+
+def _safelink_api_flow(redirect_base: str, ray_id: str, alias: str) -> str | None:
+    """
+    Drive the khaddavi API (session -> verify -> go) to obtain the activated
+    ready/go URL, then extract the real destination from it.
+    """
+    api_base = redirect_base.rstrip("/")
+    parsed = urlparse(redirect_base)
+    api_host = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Use a dedicated session so cookies never collide across domains.
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    headers = {**HEADERS, "Content-Type": "application/json"}
+
+    try:
+        # 1. GET redirect.php -> sets XSRF-TOKEN + SESSION cookies.
+        resp = sess.get(
+            f"{api_base}?ray_id={quote(ray_id)}&alias={quote(alias)}",
+            timeout=TIMEOUT, allow_redirects=True,
+        )
+        xsrf = sess.cookies.get("XSRF-TOKEN", "")
+        if not xsrf:
+            return None
+
+        # 2. /api/session  (_token = XSRF token with the tail replaced by a
+        #    "#"+base64 fingerprint — the server only loosely validates it).
+        fp = ""
+        o = "#" + _b64url(fp)
+        token = xsrf[:128 - len(o)] + o
+
+        s = sess.post(
+            f"{api_host}/api/session", json={"_token": token},
+            headers=headers, timeout=TIMEOUT,
+        )
+        if not s.ok:
+            return None
+        state = s.json()
+        # If a captcha or passcode is required, bail (can't automate those).
+        if state.get("captcha") or state.get("passcode"):
+            return None
+
+        v = sess.post(
+            f"{api_host}/api/verify",
+            json={"_a": 1, "captcha": "", "passcode": ""},
+            headers=headers, timeout=TIMEOUT,
+        )
+        if not v.ok:
+            return None
+
+        g = sess.post(
+            f"{api_host}/api/go",
+            json={"key": 123, "size": "3840.2160"},
+            headers=headers, timeout=TIMEOUT,
+        )
+        if not g.ok:
+            return None
+        ready_url = g.json().get("url")
+        if not ready_url:
+            return None
+    except (requests.RequestException, ValueError):
+        return None
+
+    # 3. Fetch the activated ready/go page -> extract the destination.
+    resp = _get(ready_url)
+    if resp is None:
+        return None
+    return _js_redirect_target(resp.text)
+
+
+def _try_safelink(host: str, html: str, base_url: str) -> str | None:
+    """Bypass a SafelinkU-style redirect to get the final destination URL."""
+    # 1. The real destination might already be in a JS redirect on this page.
+    direct = _js_redirect_target(html)
+    if direct:
+        return direct
+
+    fields = _form_hidden_fields(html)
+    ray_id = fields.get("ray_id")
+    alias = fields.get("alias")
+
+    # 2. If we are already on a khaddavi page, drive its API flow.
+    if host in ("app.khaddavi.net", "khaddavi.net"):
+        if ray_id and alias:
+            return _safelink_api_flow(base_url, ray_id, alias)
+        return None
+
+    # 3. On the sfl.gl landing page, get ray_id + alias + the khaddavi form
+    #    action, then drive the API flow there.
+    if not ray_id or not alias:
+        return None
+    am = _FORM_ACTION_RE.search(html)
+    if am:
+        action = urljoin(base_url, _html.unescape(am.group(1)))
+        dest = _safelink_api_flow(action, ray_id, alias)
+        if dest:
+            return dest
+
+    # 4. Fallback: hit /ready/go directly (works if already activated).
+    ready_url = (
+        f"https://{host}/ready/go"
+        f"?t={quote(_b64url(ray_id))}&a={quote(_b64url(alias))}"
+    )
+    resp = _get(ready_url)
+    if resp is None:
+        return None
+    return _js_redirect_target(resp.text)
 
 
 def _try_csrf_unlock(final_url: str, html: str) -> str | None:
@@ -302,6 +462,12 @@ def resolve(url: str, depth: int = 0, seen: set[str] | None = None) -> list[str]
         if _is_noise(final_url):
             return []
         return [final_url]
+
+    # SafelinkU / khaddavi redirect chain -> skip straight to /ready/go.
+    if own_host in SAFELINK_HOSTS:
+        dest = _try_safelink(own_host, html, final_url)
+        if dest:
+            return [dest]
 
     # Link-protection "unlock" form (POST + CSRF) -> reveals the real links.
     unlocked = _try_csrf_unlock(final_url, html)
