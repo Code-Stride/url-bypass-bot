@@ -1,28 +1,44 @@
 """
-unshortener.py — Core URL "bypass" / unshortening engine.
+unshortener.py — Advanced URL "bypass" / unshortening engine.
 
 How it works (layered strategy):
-  1. Follow HTTP redirects to reach the final landing page.
-  2. Handle <meta http-equiv="refresh"> redirects.
-  3. For link-protection / "money-earning" shorteners (mobilejsr.com,
-     linkszilla.top, adf.ly-style, etc.) the REAL destination link is almost
-     always embedded directly in the page HTML (an <a href>, a hidden input,
-     a JS variable, a data-* attribute).  We extract every candidate URL.
-  4. Filter out noise (ad networks, trackers, the shortener's own domain).
-  5. Recursively resolve any candidate that is itself a known shortener,
-     up to a depth limit.  Return all genuine destinations (mirrors included).
+  1. Parameter & Token Unpacking:
+     Detect embedded / Base64 / Hex / URL-encoded destination URLs in query
+     parameters (e.g. sfl.gl/ready/go?u=..., ?url=..., ?link=..., ?target=...,
+     ?r=..., ?dest=..., ?go=..., etc.).
+  2. Follow HTTP redirects (301, 302, 303, 307, 308) with realistic browser
+     session headers and cookie persistence.
+  3. Intermediary / Safelink Script Handling:
+     Detect redirect scripts (/redirect.php, /safe.php, /go.php, /ready/go, etc.)
+     on intermediary blogs (khaddavi.net, tutwuri.id, bahasteknologi.com, etc.),
+     fetch/submit them with session cookies & Referer, and unpack the target.
+  4. Form Unlock & CSRF:
+     Submit link-protection / countdown POST forms with CSRF and hidden tokens.
+  5. JS / Service Specific Decoders:
+     AdF.ly ysmm decoder, AdFoc.us click_url, Sub2Unlock / Rekonise / Boost.ink
+     data-url and inline JSON target extractors.
+  6. Noise & Priority Filtering:
+     Filter out ad networks, trackers, CDN static assets, social share links,
+     anti-adblock pages, and rank genuine destination hosts (Mediafire, Mega,
+     Google Drive, GitHub, etc.) at the top.
+  7. Recursive Resolution:
+     Recursively resolve any candidate that is itself a known shortener or
+     intermediary hop up to MAX_DEPTH.
 """
 
 from __future__ import annotations
 
+import base64
 import html as _html
+import json
 import re
-from urllib.parse import urljoin, urlparse
+import urllib.parse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 
 TIMEOUT = 15
-MAX_DEPTH = 5
+MAX_DEPTH = 6
 
 HEADERS = {
     "User-Agent": (
@@ -30,13 +46,20 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # ---------------------------------------------------------------------------
-# Known shortener / link-protection domains.  A candidate URL whose domain is
-# in this set gets resolved recursively (it is NOT the final destination).
+# Known shortener / link-protection / safelink intermediary domains.
 # ---------------------------------------------------------------------------
 KNOWN_SHORTENERS = {
     # classic shorteners
@@ -47,23 +70,53 @@ KNOWN_SHORTENERS = {
     "cutt.us", "git.io", "hyphen.com", "kutt.it", "mzl.la", "amzn.to",
     "mcaf.ee", "lnkd.in", "okt.to", "pear.do", "psce.pw", "qr.ae", "rotf.lol",
     "shortcm.li", "snip.ly", "t2m.io", "trimurl.co", "u.to", "yourls.org",
+    "cleanuri.com", "tinyone.cf", "bl.ly", "linklyhq.com",
+
+    # Safelink / SafelinkU / Tutwuri / Indonesian shorteners & blogs
+    "sfl.gl", "sfl2.gl", "sflist.com", "safelinku.com", "safelinku.net",
+    "tutwuri.id", "tutwuri.net", "khaddavi.net", "app.khaddavi.net",
+    "bahasteknologi.com", "litetekno.com", "idsly.bid", "idsly.net",
+    "suarankri.me", "lokerwfh.net", "shortxlinks.in", "v2links.me",
+    "clks.pro", "clk.wiki", "teknosemesta.com", "karyawan.co.id",
+    "tempatwisata.pro", "lajangspot.web.id", "inshortnote.com",
+    "teknoasian.com", "beritain.id", "seputargit.com", "reminimod.co",
+    "adikfilm.link", "adikfilm.click", "billasopus.com", "besargaji.com",
+    "droplink.co", "droplink.org", "semawur.com", "semawur.id", "rodimalam.com",
+
     # ad / link-protection ("money") shorteners
-    "adf.ly", "adfoc.us", "bc.vc", "bcvc.live", "ouo.io", "shorte.st",
+    "adf.ly", "adfoc.us", "bc.vc", "bcvc.live", "ouo.io", "shorte.st", "sh.st",
     "shink.me", "shrinkme.io", "shrinkearn.com", "linkvertise.com",
     "link-to.net", "link-center.net", "up-to-down.net", "linkszilla.top",
     "mobilejsr.com", "link.tl", "exe.io", "exey.io", "stfly.me", "za.gl",
     "aylink.co", "ayw.top", "boost.ink", "clk.sh", "cuty.io", "dlaf.info",
-    "fc.lc", "gplinks.co", "gplink.co", "krownlinks.me", "laymro.com",
-    "link1s.com", "mboost.me", "meoqw.com", "moiity.com", "mytc.pw",
-    "newsurl.xyz", "pihe.in", "pnd.tl", "rekonise.com", "short-jambo.com",
-    "sub2unlock.com", "sub2unlock.net", "sub2get.com", "tekcrypt.in",
+    "fc.lc", "fc-lc.com", "fc-lc.xyz", "gplinks.co", "gplink.co", "gplinks.in",
+    "krownlinks.me", "laymro.com", "link1s.com", "mboost.me", "meoqw.com",
+    "moiity.com", "mytc.pw", "newsurl.xyz", "pihe.in", "pnd.tl", "rekonise.com",
+    "short-jambo.com", "sub2unlock.com", "sub2unlock.net", "sub2unlock.io",
+    "sub4unlock.io", "sub4unlock.co", "sub2get.com", "tekcrypt.in",
     "thinfi.com", "try2link.com", "urlsopen.com", "vivads.net", "xpshort.com",
     "rswebsols.com", "adshort.co", "adshort.im", "link4m.co", "lnkload.com",
-    "sflist.com", "heylink.me", "safevideolink.com", "cyberpandit.in",
-    "techymozo.com", "bindaaslinks.com", "indiurl.com", "shorte.be",
-    "tutorialslink.com", "linkrex.net", "earnvisits.com", "clicksfly.com",
-    "smoner.com", "openget.net", "themefiles.net", "filelink.org",
-    "cpmlink.net", "skmurl.com", "clkmein.com", "cobrabirla.com",
+    "heylink.me", "safevideolink.com", "cyberpandit.in", "techymozo.com",
+    "bindaaslinks.com", "indiurl.com", "shorte.be", "tutorialslink.com",
+    "linkrex.net", "earnvisits.com", "clicksfly.com", "smoner.com",
+    "openget.net", "themefiles.net", "filelink.org", "cpmlink.net",
+    "skmurl.com", "clkmein.com", "cobrabirla.com", "shortzon.com",
+    "adpaylink.com", "cash4link.link", "pdiskpro.in", "slfly.net",
+    "icashfly.com", "10short.pro", "10short.vip", "crazyblog.in",
+    "ushort.xyz", "flashlinks.in", "filmypoints.in", "forextrader.site",
+    "kpslink.in", "techleets.xyz", "happyfiles.dtglinks.in", "bestshortlink.top",
+    "getslinks.online", "cloudshrinker.com", "eductin.com", "pvidly.in",
+    "speedynews.xyz", "paylinnk.com", "syflink.com", "acortalink.net",
+    "acortalink.me", "bstlar.com", "rotizer.net", "linkforearn.com",
+    "downfile.site", "enlacito.com", "adtival.network", "imagereviser.com",
+    "amanguides.com", "stockmarg.com", "8tm.net", "bestfonts.pro",
+    "paycut.pro", "forex-trnd.com", "sharetext.me", "fansonlinehub.com",
+    "slink.bid", "creditsgoal.com", "zegtrends.com", "linkspy.cc",
+    "dinheiromoney.com", "flamebook.eu.org", "jobzhub.store", "curto.win",
+    "infonerd.org", "yitarx.com", "videolyrics.in", "takefile.link",
+    "coinsrev.com", "socialwolvez.com", "shortit.pw", "playnano.online",
+    "2linkes.com", "mazen-ve3.com", "1shortlink.com", "1short.io",
+    "revlink.pro", "cshort.org", "linksly.co", "lksfy.com", "almontsf.com",
 }
 
 # Domains that are never the real destination (ad networks, trackers, cdn).
@@ -74,9 +127,9 @@ NOISE_DOMAINS = {
     "facebook.com", "fbcdn.net", "facebook.net", "twitter.com", "x.com",
     "twimg.com", "instagram.com", "youtube.com", "youtube-nocookie.com",
     "ytimg.com", "tiktok.com", "linkedin.com", "reddit.com", "pinterest.com",
-    "whatsapp.com", "telegram.org", "t.me", "vk.com", "discord.com",
-    "cloudflare.com", "cloudflareinsights.com", "w3.org", "schema.org",
-    "jquery.com", "gravatar.com", "recaptcha.net", "hcaptcha.com",
+    "whatsapp.com", "api.whatsapp.com", "telegram.org", "t.me", "vk.com",
+    "discord.com", "cloudflare.com", "cloudflareinsights.com", "w3.org",
+    "schema.org", "jquery.com", "gravatar.com", "recaptcha.net", "hcaptcha.com",
     "addthis.com", "sharethis.com", "disqus.com", "onesignal.com",
     "pushalert.co", "pushowl.com", "profitablecpmratenetwork.com",
     "propellerads.com", "popads.net", "popcash.net", "adsterra.com",
@@ -86,15 +139,35 @@ NOISE_DOMAINS = {
     "llvpn.com", "adl-media.com", "amung.us", "statcounter.com",
     "histats.com", "hitcounter.com", "clicky.com", "zopim.com",
     "tawk.to", "intercom.io", "crisp.chat", "livechatinc.com",
-    # anti-adblock / "please disable adblocker" landing pages — never a
-    # real destination, they are navigation/help links injected by trackers.
+    # anti-adblock / "please disable adblocker" landing pages
     "antiblock.org", "adblockplus.org", "adblock.com", "getadblock.com",
     "ublock.org", "ublockorigin.com", "ghostery.com", "adguard.com",
     "nothanks.com", "blockadblock.com", "fuckadblock.site",
 }
 
+# Preferred file hosts / genuine destination services for priority ranking
+HIGH_PRIORITY_HOSTS = {
+    "mediafire.com", "mega.nz", "mega.co.nz", "drive.google.com",
+    "dropbox.com", "github.com", "gitlab.com", "gofile.io",
+    "1fichier.com", "pixeldrain.com", "rapidgator.net", "krakenfiles.com",
+    "workupload.com", "uploadhaven.com", "apkadmin.com", "files.fm",
+    "katfile.com", "udrop.com", "buzzheavier.com", "bowfile.com",
+    "dailyuploads.net", "megaup.net", "mega4upload.net", "zippyshare.com",
+    "modsfire.com", "terabox.com", "terabox.app", "upload.ee", "dbree.me",
+    "easyupload.io", "dropgalaxy.com", "file-upload.net", "file-upload.org",
+    "filemoon.sx", "send.now", "dataupload.net", "turbobit.net",
+    "sharemods.com", "desiupload.co", "modsbase.com", "doodrive.com",
+    "qiwi.gg", "up-4ever.net", "hitfile.net", "sourceforce.net",
+}
+
+# Intermediary / Safelink redirect scripts and paths that are NEVER final destinations
+INTERMEDIARY_PATH_RE = re.compile(
+    r"""/(?:redirect|safe|go|out|links|link|get-link|direct|download|view|landing)\.php\b|/(?:ready/go|go/|safe/|links?/)\b""",
+    re.IGNORECASE,
+)
+
 _LINK_RE = re.compile(
-    r"""(?:href|src|action|data-url|data-link|data-href|data-target-url|content)\s*=\s*["']([^"']+)["']""",
+    r"""(?:href|src|action|data-url|data-link|data-href|data-target-url|data-target|data-destination|content)\s*=\s*["']([^"']+)["']""",
     re.IGNORECASE,
 )
 _META_REFRESH_RE = re.compile(
@@ -105,31 +178,32 @@ _SCRIPT_URL_RE = re.compile(
     r"""["']((?:https?://)[^"'\s<>]{4,})["']""",
     re.IGNORECASE,
 )
+_JS_LOCATION_RE = re.compile(
+    r"""(?:window\.)?(?:location|document\.location)(?:\.href)?\s*=\s*["']([^"']+)["']|location\.(?:replace|assign)\s*\(\s*["']([^"']+)["']\s*\)""",
+    re.IGNORECASE,
+)
+_ADFLY_YSMM_RE = re.compile(r"""(?:var\s+)?ysmm\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
+_ADFOCUS_CLICK_RE = re.compile(r"""(?:var\s+)?click_url\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 
-# --- Link-protection "unlock" form handling --------------------------------
-# Many link-protection sites (mobilejsr.com and friends) hide the real links
-# behind a <form method="post"> that must be submitted together with a hidden
-# CSRF token.  The token is tied to the PHP session cookie, so we must GET the
-# page first (which plants the cookie) and then POST the form back.
+# Form parsing
 _FORM_BLOCK_RE = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.IGNORECASE | re.DOTALL)
-_HIDDEN_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+_INPUT_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
 _NAME_RE = re.compile(r"""name\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 _VALUE_RE = re.compile(r"""value\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
 _ACTION_RE = re.compile(r"""action\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
-_CSRF_NAMES = {
-    "_csrf", "csrf", "csrf_token", "csrftoken", "csrfToken", "token",
-    "_token", "__requestverificationtoken", "authenticity_token",
-}
 
 _session = requests.Session()
 
 
-def _get(url: str) -> requests.Response | None:
-    """Fetch a URL following redirects, with a browser-like UA."""
+def _get(url: str, referer: str | None = None) -> requests.Response | None:
+    """Fetch a URL following redirects, with a browser-like UA and Referer."""
+    req_headers = dict(HEADERS)
+    if referer:
+        req_headers["Referer"] = referer
     try:
         resp = _session.get(
             url,
-            headers=HEADERS,
+            headers=req_headers,
             timeout=TIMEOUT,
             allow_redirects=True,
         )
@@ -141,27 +215,35 @@ def _get(url: str) -> requests.Response | None:
 def _host(url: str) -> str:
     h = (urlparse(url).hostname or "").lower()
     if h.startswith("www."):
-        h = h[3:]
+        h = h[4:]
     return h
 
 
 # Static assets are never the destination a user is looking for.
 _ASSET_EXT_RE = re.compile(
     r"\.(js|css|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|otf|eot|mp3|mp4|"
-    r"webm|avi|mov|zip|rar|7z|gz|tar|pdf|map|json|xml|txt)$",
+    r"webm|avi|mov|map|json|xml|txt)$",
     re.IGNORECASE,
 )
 
 
 def _normalize(url: str) -> str:
-    """Unescape HTML entities and make a relative URL absolute-ish."""
+    """Unescape HTML entities and strip whitespace."""
     url = _html.unescape(url).strip()
     url = url.replace("&amp;", "&")
     return url
 
 
 def _is_shortener(url: str) -> bool:
-    return _host(url) in KNOWN_SHORTENERS
+    h = _host(url)
+    if not h:
+        return False
+    if h in KNOWN_SHORTENERS:
+        return True
+    for s in KNOWN_SHORTENERS:
+        if h.endswith("." + s):
+            return True
+    return False
 
 
 def _is_noise(url: str) -> bool:
@@ -171,27 +253,150 @@ def _is_noise(url: str) -> bool:
     for d in NOISE_DOMAINS:
         if h == d or h.endswith("." + d):
             return True
+    # Filter social share endpoints
+    p = urlparse(url)
+    if "facebook.com/sharer" in url or "twitter.com/intent" in url or "api.whatsapp.com" in url:
+        return True
     return False
 
 
-def _try_csrf_unlock(final_url: str, html: str) -> str | None:
+def _is_intermediary(url: str) -> bool:
+    """Check if URL points to an intermediary redirect script rather than a final page."""
+    p = urlparse(url)
+    if INTERMEDIARY_PATH_RE.search(p.path):
+        return True
+    return False
+
+
+def try_decode_base64_url(s: str) -> str | None:
     """
-    If the page is a link-protection "unlock" page, find its POST form and
-    submit it (with the hidden CSRF token + session cookie) to reveal the
-    real links.  Returns the unlocked HTML on success, else None.
+    Attempt to decode a string as single or multi-level Base64 to find an embedded URL.
+    Supports standard Base64, URL-safe Base64, and URL-encoded strings.
     """
+    if not isinstance(s, str) or len(s) < 8:
+        return None
+    curr = s.strip()
+    for _ in range(6):
+        try:
+            curr = unquote(curr)
+            # URL-safe base64 substitution
+            std_b64 = curr.replace("-", "+").replace("_", "/")
+            padded = std_b64 + "=" * (-len(std_b64) % 4)
+            decoded_bytes = base64.b64decode(padded, validate=False)
+            decoded = decoded_bytes.decode("utf-8", errors="ignore").strip()
+            if not decoded:
+                break
+            if decoded.startswith(("http://", "https://")):
+                return decoded
+            m = re.search(r"https?://[^\s\"'<>]+", decoded)
+            if m:
+                return m.group(0)
+            # If decoded looks like another base64 string, continue loop
+            if re.match(r"^[A-Za-z0-9+/=_-]{8,}$", decoded):
+                curr = decoded
+            else:
+                break
+        except Exception:
+            break
+    return None
+
+
+def unpack_embedded_url(url: str) -> str | None:
+    """
+    Check if a URL contains an embedded destination URL in its query parameters,
+    fragment, or path (e.g. sfl.gl/ready/go?u=..., ?url=..., ?r=..., ?dest=...).
+    """
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+
+    # 1. Query parameters
+    qs = parse_qs(p.query, keep_blank_values=False)
+    # Check common target param keys first, then all
+    priority_keys = [
+        "u", "url", "link", "target", "dest", "destination", "r", "to",
+        "go", "dl", "download", "file", "safe", "redirect", "redirect_to",
+        "uri", "data", "i", "newwll", "token", "k", "href", "out"
+    ]
+    all_keys = priority_keys + [k for k in qs if k not in priority_keys]
+
+    for k in all_keys:
+        for val in qs.get(k, []):
+            val = val.strip()
+            # Direct URL
+            if val.startswith(("http://", "https://")):
+                return val
+            # URL-encoded direct URL
+            unq = unquote(val)
+            if unq.startswith(("http://", "https://")):
+                return unq
+            # Base64 encoded URL
+            b64 = try_decode_base64_url(val)
+            if b64:
+                return b64
+
+    # 2. Fragment
+    if p.fragment:
+        frag = p.fragment.strip()
+        if frag.startswith(("http://", "https://")):
+            return frag
+        b64 = try_decode_base64_url(frag)
+        if b64:
+            return b64
+
+    # 3. Path suffix / encoded segments (e.g. /go/aHR0cHM...)
+    path_segments = p.path.strip("/").split("/")
+    for seg in path_segments:
+        b64 = try_decode_base64_url(seg)
+        if b64:
+            return b64
+
+    return None
+
+
+def decode_adfly(ysmm: str) -> str | None:
+    """Decode AdF.ly / ysmm obfuscated target URL."""
+    try:
+        I, X = "", ""
+        for i in range(len(ysmm)):
+            if i % 2 == 0:
+                I += ysmm[i]
+            else:
+                X = ysmm[i] + X
+        encoded = list(I + X)
+        for i in range(len(encoded)):
+            if encoded[i].isdigit():
+                for j in range(i + 1, len(encoded)):
+                    if encoded[j].isdigit():
+                        num = int(encoded[i]) ^ int(encoded[j])
+                        if num < 10:
+                            encoded[i] = str(num)
+                        break
+        decoded = base64.b64decode("".join(encoded).encode()).decode("utf-8", errors="ignore")
+        res = decoded[16:-16]
+        if res.startswith(("http://", "https://")):
+            return res
+    except Exception:
+        pass
+    return None
+
+
+def _try_form_unlock(final_url: str, html: str) -> list[str]:
+    """
+    Handle POST forms on link-protection / safelink pages (mobilejsr, khaddavi,
+    tutwuri, ouo, etc.) and submit them to retrieve the unlocked HTML or redirect.
+    """
+    results: list[str] = []
     for m in _FORM_BLOCK_RE.finditer(html):
         open_tag = m.group(1)
         inner = m.group(2)
-        if "post" not in open_tag.lower():
-            continue
 
         am = _ACTION_RE.search(open_tag)
         action = urljoin(final_url, _html.unescape(am.group(1))) if am else final_url
 
         data: dict[str, str] = {}
-        has_csrf = False
-        for inp in _HIDDEN_RE.findall(inner):
+        for inp in _INPUT_RE.findall(inner):
             nm = _NAME_RE.search(inp)
             if not nm:
                 continue
@@ -199,10 +404,13 @@ def _try_csrf_unlock(final_url: str, html: str) -> str | None:
             vm = _VALUE_RE.search(inp)
             value = _html.unescape(vm.group(1)) if vm else ""
             data[name] = value
-            if name.lower() in _CSRF_NAMES:
-                has_csrf = True
 
-        if not has_csrf:
+            # Check if any input value is an encoded URL
+            unpacked = unpack_embedded_url(f"?val={value}")
+            if unpacked and not _is_noise(unpacked):
+                results.append(unpacked)
+
+        if not data and "post" not in open_tag.lower():
             continue
 
         try:
@@ -213,18 +421,37 @@ def _try_csrf_unlock(final_url: str, html: str) -> str | None:
                 timeout=TIMEOUT,
                 allow_redirects=True,
             )
+            if resp.ok and resp.url and resp.url != final_url:
+                results.append(resp.url)
+            if resp.ok and resp.text:
+                # Check for unpacked URL in response url
+                unp = unpack_embedded_url(resp.url)
+                if unp:
+                    results.append(unp)
         except requests.RequestException:
             continue
-        if resp.ok and resp.text:
-            return resp.text
-    return None
+    return results
 
 
 def _extract_candidates(html: str, base_url: str, own_host: str) -> list[str]:
-    """Pull every plausible destination URL out of the page."""
+    """Pull every plausible destination URL out of the page HTML / JS."""
     found: list[str] = []
 
-    # 1. tag attributes (href / src / data-url / action / ...)
+    # 1. Check for AdFly ysmm
+    ym = _ADFLY_YSMM_RE.search(html)
+    if ym:
+        decoded = decode_adfly(ym.group(1))
+        if decoded:
+            found.append(decoded)
+
+    # 2. Check for AdFocus click_url
+    cm = _ADFOCUS_CLICK_RE.search(html)
+    if cm:
+        target = _normalize(cm.group(1))
+        if target.startswith(("http://", "https://")):
+            found.append(target)
+
+    # 3. Tag attributes (href / src / data-url / data-destination / action / ...)
     for raw in _LINK_RE.findall(html):
         url = _normalize(raw)
         if url.startswith("//"):
@@ -232,39 +459,65 @@ def _extract_candidates(html: str, base_url: str, own_host: str) -> list[str]:
         url = urljoin(base_url, url)
         found.append(url)
 
-    # 2. raw http(s) URLs embedded anywhere (scripts, JSON, JS variables)
+    # 4. JS location changes
+    for m in _JS_LOCATION_RE.finditer(html):
+        target = m.group(1) or m.group(2)
+        if target:
+            target = urljoin(base_url, _normalize(target))
+            found.append(target)
+
+    # 5. Raw http(s) URLs embedded anywhere in scripts / JSON / variables
     for raw in _SCRIPT_URL_RE.findall(html):
         url = _normalize(raw)
         found.append(urljoin(base_url, url))
 
+    # 6. Embedded base64 strings in script / HTML
+    for b64_match in re.findall(r"""["']([A-Za-z0-9+/=_-]{20,})["']""", html):
+        decoded = try_decode_base64_url(b64_match)
+        if decoded and not _is_noise(decoded):
+            found.append(decoded)
+
     out: list[str] = []
     seen: set[str] = set()
     for url in found:
-        p = urlparse(url)
-        if p.scheme not in ("http", "https"):
-            continue
-        host = (p.hostname or "").lower()
-        if not host:
-            continue
-        # drop static assets and known noise/ad domains
-        if _ASSET_EXT_RE.search(p.path):
-            continue
-        host_n = _host(url)
-        # drop the shortener's own pages and known noise/ad domains
-        if host_n == own_host or _is_noise(url):
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        out.append(url)
+        # Check if URL itself has embedded params
+        unpacked = unpack_embedded_url(url)
+        candidates_to_add = [unpacked, url] if unpacked else [url]
+
+        for cand in candidates_to_add:
+            p = urlparse(cand)
+            if p.scheme not in ("http", "https"):
+                continue
+            host = (p.hostname or "").lower()
+            if not host:
+                continue
+            if _ASSET_EXT_RE.search(p.path):
+                continue
+            if _is_noise(cand):
+                continue
+            if cand in seen:
+                continue
+            seen.add(cand)
+            out.append(cand)
     return out
+
+
+def _score_candidate(url: str) -> int:
+    """Score candidate URLs so real download/file hosts are ranked highest."""
+    h = _host(url)
+    for p in HIGH_PRIORITY_HOSTS:
+        if h == p or h.endswith("." + p):
+            return 100
+    if _is_intermediary(url) or _is_shortener(url):
+        return 10
+    return 50
 
 
 def resolve(url: str, depth: int = 0, seen: set[str] | None = None) -> list[str]:
     """
     Resolve a (possibly shortened / protected) URL to its real destination(s).
 
-    Returns a list of destination URLs (mirrors included), empty on failure.
+    Returns a list of destination URLs, empty on failure.
     """
     seen = seen if seen is not None else set()
     if depth > MAX_DEPTH:
@@ -273,6 +526,17 @@ def resolve(url: str, depth: int = 0, seen: set[str] | None = None) -> list[str]
         return []
     seen.add(url)
 
+    # Step 1: Pre-check if input URL has embedded destination (e.g. sfl.gl/ready/go?u=...)
+    unpacked = unpack_embedded_url(url)
+    if unpacked and unpacked not in seen:
+        if not _is_shortener(unpacked) and not _is_intermediary(unpacked) and not _is_noise(unpacked):
+            # Already genuine destination!
+            return [unpacked]
+        sub = resolve(unpacked, depth + 1, seen)
+        if sub:
+            return sub
+
+    # Step 2: Fetch the URL following HTTP redirects
     resp = _get(url)
     if resp is None:
         return []
@@ -280,51 +544,89 @@ def resolve(url: str, depth: int = 0, seen: set[str] | None = None) -> list[str]
     final_url = resp.url
     content_type = resp.headers.get("Content-Type", "").lower()
 
-    # Not an HTML page -> this IS the destination (file, image, api, ...).
+    # Step 3: Check landing URL for embedded destination
+    unpacked_final = unpack_embedded_url(final_url)
+    if unpacked_final and unpacked_final not in seen:
+        if not _is_shortener(unpacked_final) and not _is_intermediary(unpacked_final) and not _is_noise(unpacked_final):
+            return [unpacked_final]
+        sub = resolve(unpacked_final, depth + 1, seen)
+        if sub:
+            return sub
+
+    # Not an HTML page -> this IS the destination (file, archive, image, etc.).
     if content_type and "html" not in content_type:
         return [final_url]
 
     html = resp.text or ""
     own_host = _host(url)
 
-    # meta-refresh redirect
+    # Step 4: Meta-refresh redirect
     m = _META_REFRESH_RE.search(html)
     if m:
         nxt = urljoin(final_url, _normalize(m.group(1)))
-        if nxt != url:
+        if nxt != url and nxt not in seen:
             return resolve(nxt, depth + 1, seen)
 
-    # A cross-host HTTP redirect means the shortener bounced us straight to
-    # the real destination (e.g. bit.ly -> example.com).  Treat that as the
-    # answer, UNLESS the target is itself a known shortener / protection page
-    # or a known noise/ad domain.
-    if _host(final_url) != own_host and not _is_shortener(final_url):
-        if _is_noise(final_url):
-            return []
+    # Step 5: Form unlock / CSRF submit
+    form_results = _try_form_unlock(final_url, html)
+    for fr in form_results:
+        if fr not in seen:
+            sub = resolve(fr, depth + 1, seen)
+            if sub:
+                return sub
+
+    # Step 6: Extract candidate URLs from page
+    candidates = _extract_candidates(html, final_url, own_host)
+
+    # Handle intermediary redirect scripts (e.g. redirect.php on safelink blog)
+    # Fetch them with active session cookies and Referer
+    for cand in list(candidates):
+        if _is_intermediary(cand) and cand not in seen:
+            try:
+                sub_res = resolve(cand, depth + 1, seen)
+                if sub_res:
+                    return sub_res
+            except Exception:
+                pass
+
+    # A cross-host HTTP redirect where final_url is not a shortener or intermediary
+    # and no intermediary scripts exist
+    if (
+        _host(final_url) != own_host
+        and not _is_shortener(final_url)
+        and not _is_intermediary(final_url)
+        and not _is_noise(final_url)
+        and not any(_is_intermediary(c) for c in candidates)
+    ):
         return [final_url]
 
-    # Link-protection "unlock" form (POST + CSRF) -> reveals the real links.
-    unlocked = _try_csrf_unlock(final_url, html)
-    if unlocked:
-        html = unlocked
-
-    candidates = _extract_candidates(html, final_url, own_host)
+    # Resolve candidates
     results: list[str] = []
+    # Sort candidates by score (file hosts first)
+    candidates.sort(key=_score_candidate, reverse=True)
 
     for cand in candidates:
+        if _is_intermediary(cand):
+            continue  # Already attempted above
         if _is_shortener(cand):
-            # still a shortener -> dig one level deeper
             results.extend(resolve(cand, depth + 1, seen))
         else:
-            # looks like a genuine destination
             results.append(cand)
 
-    if results:
-        return list(dict.fromkeys(results))  # dedup, keep order
+    # Filter out intermediary scripts and noise from final results
+    filtered_results = [
+        r for r in results
+        if not _is_noise(r) and not _is_intermediary(r)
+    ]
 
-    # Fallback: no embedded links found, but the redirect landed elsewhere.
-    if _host(final_url) != own_host:
+    if filtered_results:
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(filtered_results))
+
+    # Fallback: if redirect landed elsewhere and is not noise/intermediary
+    if _host(final_url) != own_host and not _is_noise(final_url) and not _is_intermediary(final_url):
         return [final_url]
+
     return []
 
 
