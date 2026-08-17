@@ -318,6 +318,16 @@ class BrowserEngine:
                     except Exception:  # noqa: BLE001
                         pass
 
+                    # Anti-bot bounce: some interstitials send suspected bots
+                    # to a search engine, which then shows its own captcha.
+                    if "/sorry/" in current or "unusual traffic" in body.lower():
+                        result.log("error", "bounced to an anti-bot captcha", current)
+                        return result.fail(
+                            "the link's interstitial detected automation and "
+                            "bounced us to a captcha. This server's IP is "
+                            "flagged — use a residential proxy."
+                        )
+
                     # Hard block from the origin (datacenter IP banned).
                     if rounds <= 2 and re.match(
                         r"^\s*(?:403 forbidden|access denied|error 1006|"
