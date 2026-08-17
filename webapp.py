@@ -134,6 +134,43 @@ async def api_trace(url: str = ""):
     return JSONResponse(await asyncio.to_thread(trace, url))
 
 
+@app.get("/api/raw")
+async def api_raw(url: str = "", q: str = "", ctx: int = 400, limit: int = 20):
+    """
+    Diagnostic: fetch a page and return snippets around a keyword (or the
+    head of the HTML when no keyword is given).  Lets a failing site's JS be
+    inspected from a host that can actually reach it.
+    """
+    url = (url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url'.")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    from httpclient import Client
+
+    client = Client()
+    resp = await asyncio.to_thread(client.get, url)
+    if resp is None:
+        raise HTTPException(status_code=502, detail="fetch failed")
+    html = resp.text or ""
+
+    snippets: list[str] = []
+    if q:
+        import re as _re
+
+        for m in list(_re.finditer(_re.escape(q), html, _re.IGNORECASE))[:limit]:
+            snippets.append(html[max(0, m.start() - ctx): m.end() + ctx])
+    return JSONResponse({
+        "url": resp.url,
+        "status": resp.status_code,
+        "backend": resp.backend,
+        "length": len(html),
+        "cookies": client.cookies,
+        "snippets": snippets or ([html[:3000]] if not q else []),
+    })
+
+
 @app.post("/telegram/{token}")
 async def telegram_webhook(token: str, request: Request):
     if not ENABLE_BOT or _tg_app is None or token != BOT_TOKEN:
