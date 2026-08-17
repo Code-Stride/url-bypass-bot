@@ -1,98 +1,185 @@
-# 🔗 URL Bypass Bot (Telegram)
+# 🔗 URL Bypass — Telegram bot + web app
 
-A Telegram bot that **unshortens / bypasses any shortened or ad-protected link**
-for free — no ads, no captcha, no waiting. Paste a link, get the real
-destination(s) instantly.
+Paste a shortened or ad-locked link, get the real destination.
+Works on **gplinks**, **liteshort**, adrinolinks, adf.ly, linkvertise,
+bit.ly and friends.
 
-It handles two kinds of links:
+Rebuilt from scratch around one lesson learned the hard way: these sites
+validate progress **server-side**, so replaying HTTP requests cannot win.
+A real browser does the real flow instead.
 
-1. **Classic shorteners** — `bit.ly`, `tinyurl.com`, `is.gd`, `goo.gl`, `t.co`, `cutt.ly`, …
-2. **Link-protection / "earn money" shorteners** — `linkszilla.top`, `mobilejsr.com`,
-   `adf.ly`, `ouo.io`, `shrinkme.io`, `linkvertise.com`, `gplinks.co`, and many more
-   (a large built-in list, easy to extend).
+---
 
-## How it works
+## Why a browser (and why the old approach failed)
 
-The engine (`unshortener.py`) uses a layered strategy:
+The previous version tried to replay the AdLinkFly protocol over HTTP:
+read the `#go-link` form, forge the `step_count` cookie, POST `/links/go`.
+Tested against the live site, gplinks answered:
 
-1. Follows HTTP redirects to the final landing page.
-2. Handles `<meta http-equiv="refresh">` redirects.
-3. Link-protection pages embed the *real* destination directly in their HTML
-   (an `<a href>`, a hidden input, a JS variable, a `data-*` attribute). The
-   bot extracts every candidate URL and filters out noise (ad networks,
-   trackers, CDNs, the shortener's own pages).
-4. If a candidate is itself a known shortener, it recurses one level deeper.
-5. Returns all genuine destinations — mirror links included.
+```
+https://gplinks.com/link-error?alias=ZkVCbbry&error_code=not_enough_steps
+```
 
-## Setup
+The ad-step counter is tracked **on the server** and advanced by JavaScript
+on the ad pages. Faking cookies does nothing. Worse, the old code then
+reported the ad blog it landed on (`https://skrresults.com`) as if it were
+the answer — a confidently wrong result, the worst kind.
 
-### 1. Create the bot
-- Open Telegram, message **@BotFather**.
-- Send `/newbot`, pick a name and a username.
-- Copy the **token** it gives you (looks like `123456789:AA...`).
+So the engine order is now:
 
-### 2. Install dependencies
+| # | Engine | Handles | Behaviour at a gate |
+|---|--------|---------|---------------------|
+| 1 | **HTTP** (`curl_cffi`, Chrome TLS fingerprint) | plain 30x chains, meta-refresh, embedded links | **stops and admits it** — never guesses |
+| 2 | **Browser** (Playwright Chromium) | countdowns, "Continue"/"Get Link" steps, ad-step counters, Cloudflare JS challenges | performs the actual clicks |
+
+Every answer from either engine is re-checked by `app/classify.py` before a
+user ever sees it.
+
+## Accuracy, honestly
+
+There is no such thing as a 100% bypass, and anything claiming it is lying:
+these sites change their flow, add captchas, geo-block, and some links are
+simply dead. What this project guarantees instead is **no confident lies**:
+
+- ad blogs / bare domains (`https://skrresults.com`) → rejected
+- error pages (`error_code=not_enough_steps`) → rejected
+- trackers, CDNs, social, ad networks → rejected
+- another shortener → resolved again, not returned
+- every answer carries a **confidence score**, and the bot warns below 60%
+
+If it cannot solve a link it says so, with the steps it took. That is far
+more useful than a wrong URL.
+
+## Run it
+
 ```bash
 pip install -r requirements.txt
+python -m playwright install chromium     # the accurate engine
+
+export BOT_TOKEN="123456:AA..."           # optional; omit for web-only
+python server.py                          # http://localhost:8080
 ```
 
-### 3. Run it
+Command line:
+
 ```bash
-export BOT_TOKEN="123456789:AA...your_token..."
-python bot.py
+python cli.py https://gplinks.co/ZkVCbbry
+python cli.py --verbose --no-browser https://bit.ly/xyz
 ```
 
-> Optionally copy `.env.example` to `.env` and source it.
+## API
 
-### 4. Use it
-Just send the bot a link (or use a command):
+| Route | Purpose |
+|---|---|
+| `GET /` | web UI |
+| `POST /api/bypass` | `{"url": "...", "verbose": true}` |
+| `GET /api/bypass?url=…&verbose=true` | same, as GET |
+| `GET /healthz` | health + whether the browser is live |
+| `POST /telegram/<BOT_TOKEN>` | Telegram webhook (auto-registered) |
 
-```
-https://secure.linkszilla.top/view/jknmzhNyFZ
-```
-
-```
-/unshort https://mobilejsr.com/view/S1cE9SKSnr
-```
-
-Commands: `/start`, `/help`, `/unshort <url>` (alias `/u <url>`).
-
-## Example output
-
-```
-✅ Found 10 links:
-
-1. https://dl.direct-cloud.top/d/Xy-dkAG
-2. https://dl.uploadflix.com/7hamrutt1qiz
-3. https://hubcloud.cx/drive/kszefbzhzcbfs8c
-4. https://new3.gdflix.io/file/uEJOpA4qq9XmX7X
-5. https://clicknupload.cam/rodovibqfn0b
-6. https://gofile.io/d/rbCpIy
-7. https://vikingfile.com/f/olIIcFVpYj
-8. https://megaup.net/9814baf60c12b1669582d8caf3f441a9/
-9. https://1fichier.com/?qfma73eg8cf8n3mtkqd3
-10. https://multiup.io/download/ef3e2c07d611d437b677a8383b78d20a/
+```json
+{
+  "ok": true,
+  "url": "https://devuploads.com/7h77e7ikjhxj",
+  "engine": "browser",
+  "confidence": 0.96,
+  "elapsed": 41.2
+}
 ```
 
-## Extending it
+`verbose=true` adds `steps` — every navigation, wait and click — so a
+failure can be diagnosed instead of guessed at.
 
-- **Add a shortener domain** → append it to `KNOWN_SHORTENERS` in `unshortener.py`.
-- **Add a noise/ad domain to ignore** → append it to `NOISE_DOMAINS`.
+## Using your own cookies
 
-## Files
+Some blocks are about *identity*, not code. You can lend the server a session
+from your own browser:
 
-| File | Purpose |
-|------|---------|
-| `bot.py` | Telegram bot (commands + auto-detect pasted links). |
-| `unshortener.py` | The resolution engine (library — usable without Telegram). |
-| `test_unshortener.py` | Quick CLI test of the engine. |
-| `requirements.txt` | Python dependencies. |
+**Web UI** — tick “use my cookies”, paste the export.
+**API** — add a `cookies` field (or `?cookies=` on GET).
+**Server-wide** — set `COOKIES_FILE=/path/cookies.txt` or `COOKIES_JSON='[…]'`.
 
-## Notes
+Accepted: Netscape `cookies.txt`, Cookie-Editor / EditThisCookie JSON,
+Playwright `storage_state`, or a plain `name=value; name2=value2` string.
 
-- The engine works on **any** host that embeds the destination in plain HTML.
-  Sites that build the link only via heavy JavaScript with anti-bot checks
-  (e.g. some Cloudflare-protected pages) may not resolve — in those cases the
-  bot reports it couldn't resolve the link.
-- Run it on a VPS / always-on machine for 24/7 availability (a free tier of
-  Render/Railway/Replit works too).
+```bash
+curl -X POST https://<domain>/api/bypass \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://gplinks.co/ZkVCbbry","cookies":"AppSession=…; csrfToken=…"}'
+```
+
+### What cookies actually fix
+
+| Situation | Helps? |
+|---|---|
+| Interstitial bounces you to a Google “unusual traffic” captcha | ✅ reuses your solved session |
+| Shortener session state (`AppSession`, `csrfToken`, `PHPSESSID`, `lid/pid/vid`) | ✅ the flow starts recognised |
+| Consent / age / region gate | ✅ |
+| Cloudflare `cf_clearance` | ⚠️ usually **no** — bound to the IP **and** UA that solved it, so a cookie from your PC fails from Railway. Works only if the server shares that IP (same proxy). |
+| Hard origin block (gplinks' `403 Forbidden`) | ❌ refused before cookies are read — needs a different IP |
+
+Cookie **values are never logged** — only counts and domains appear in the step trail.
+
+## Deploy to Railway
+
+The `Dockerfile` is based on Microsoft's Playwright image, so Chromium and
+all its system libraries are present — this is what makes the browser engine
+work in production.
+
+1. **New Project → Deploy from GitHub repo**, branch
+   `arena/01a00df5-url-bypass-bot`.
+2. Railway reads `railway.json` (Docker build, health check `/healthz`).
+3. **Settings → Networking → Generate Domain** (needed for the webhook).
+4. **Variables → `BOT_TOKEN`**. That's it.
+
+Give the service ~1 GB RAM; each concurrent browser costs ~250 MB
+(`BROWSER_CONCURRENCY`, default 2).
+
+### Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOT_TOKEN` | – | Telegram token; omit for web-only |
+| `ENABLE_BOT` | `1` | `0` = website only |
+| `USE_BROWSER` | `1` | `0` = HTTP only (much less accurate) |
+| `BROWSER_CONCURRENCY` | `2` | parallel browser resolutions |
+| `RESOLVE_TIMEOUT` | `180` | total budget per link (s) |
+| `COOKIES_FILE` | – | cookies.txt / JSON export applied to every request |
+| `COOKIES_JSON` | – | same, inline |
+| `BROWSER_TIMEOUT` | `150` | browser budget per link (s) |
+
+## Telegram commands
+
+`/start` · `/bypass <url>` (also `/b`, `/u`) · `/details` — shows exactly how
+the last link was solved.
+
+## Layout
+
+| Path | Purpose |
+|---|---|
+| `app/classify.py` | decides destination vs shortener vs noise — the accuracy backbone |
+| `app/cookies.py` | parses cookies.txt / JSON / header exports, feeds both engines |
+| `app/resolver.py` | runs the engines, re-verifies, follows shortener chains |
+| `app/engines/http.py` | fast path; bails out at gates |
+| `app/engines/browser.py` | Playwright engine that does the real flow |
+| `app/web/api.py`, `app/web/ui.py` | FastAPI app and the UI |
+| `app/bot.py` | Telegram bot |
+| `server.py`, `cli.py` | entrypoints |
+| `tests/` | offline suite + a mock replicating the live gplinks behaviour |
+
+## Tests
+
+```bash
+python -m tests.test_all
+```
+
+The mock in `tests/mock_shortener.py` reproduces the real traces: a
+parameter-less redirect to an ad blog, cookie-planted `lid/pid/vid`,
+**server-side** step validation, and the `not_enough_steps` refusal — so the
+regressions that broke the old build are locked in.
+
+## Legal note
+
+Intended for reaching content you are entitled to access without hostile
+interstitials. Link shorteners fund creators through ads; bypassing them
+removes that income. Use responsibly and respect each site's terms.

@@ -1,2 +1,10 @@
+# web + api
+fastapi>=0.115
+uvicorn[standard]>=0.30
+# telegram
 python-telegram-bot>=21.0
-requests>=2.31
+# http engines
+requests>=2.32
+curl_cffi>=0.7
+# browser engine (the accurate path)
+playwright>=1.47
