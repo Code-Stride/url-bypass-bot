@@ -271,9 +271,13 @@ class Client:
         if json is not None:
             kw["json"] = json
 
+        had_clearance = "cf_clearance" in self.cookies
+
         resp = self._via_curl(method, url, **kw)
         if resp is not None and not is_cloudflare_challenge(resp):
-            return resp
+            return self._reload_after_clearance(
+                method, url, kw, resp, had_clearance
+            )
 
         alt = self._via_scraper(method, url, **kw)
         if alt is not None and not is_cloudflare_challenge(alt):
@@ -292,6 +296,25 @@ class Client:
             if plain is not None:
                 return plain
         return resp or alt
+
+    def _reload_after_clearance(
+        self, method, url, kw, resp: Response, had_clearance: bool
+    ) -> Response:
+        """
+        Cloudflare often answers the first request with a clearance-setting
+        response whose body is not the page we asked for.  When a fresh
+        cf_clearance appears, replay the request once with it.
+        """
+        if had_clearance or "cf_clearance" not in self.cookies:
+            return resp
+        kw = dict(kw)
+        hdrs = dict(kw.get("headers") or {})
+        hdrs["Cookie"] = self.cookie_header()
+        kw["headers"] = hdrs
+        retry = self._via_curl(method, url, **kw)
+        if retry is not None and not is_cloudflare_challenge(retry):
+            return retry
+        return resp
 
     def get(self, url: str, **kw) -> Response | None:
         return self.request("GET", url, **kw)

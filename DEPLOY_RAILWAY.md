@@ -1,43 +1,74 @@
 # Deploying to Railway (https://railway.app)
 
-The bot auto-detects Railway and runs in **webhook mode** — no code changes
-needed, just these steps.
+One service runs **both** the Telegram bot and the website/API — `server.py`
+binds `0.0.0.0:$PORT`, serves the web UI at `/`, the JSON API at `/api/bypass`,
+and registers the Telegram webhook at `/telegram/<BOT_TOKEN>` on startup.
 
 ## 1. Create the bot & get a token
 - Message **@BotFather** on Telegram → `/newbot` → copy the token.
+- Want the website only? Just skip the token (or set `ENABLE_BOT=0`).
 
-## 2. Put your code on GitHub
-- Create a repo and push the contents of this folder
-  (`bot.py`, `unshortener.py`, `requirements.txt`, `railway.json`).
+## 2. Push this branch to GitHub
+Already done — deploy from the branch `arena/01a00df5-url-bypass-bot`.
 
 ## 3. Deploy on Railway
-1. Go to https://railway.app → **New Project** → **Deploy from GitHub repo**.
-2. Pick your repo. Railway auto-detects Python via `requirements.txt`
-   (or the `Dockerfile` if you prefer) and uses the `startCommand` from
-   `railway.json`.
-3. Open your service → **Variables** → add:
-   | Name | Value |
-   |------|-------|
-   | `BOT_TOKEN` | `123456789:AA...` (from BotFather) |
+1. https://railway.app → **New Project** → **Deploy from GitHub repo**.
+2. Pick the repo, then **Settings → Source** → set the branch to
+   `arena/01a00df5-url-bypass-bot`.
+3. Railway reads `railway.json`: start command `python server.py`,
+   health check `/healthz`. (The `Dockerfile` works too if you prefer it.)
+4. **Settings → Networking → Generate Domain** — this is required, the bot
+   uses that domain for its webhook.
+5. **Variables** → add:
 
-   That's it — `RAILWAY_PUBLIC_DOMAIN` and `PORT` are injected automatically,
-   and the bot sets its own Telegram webhook on startup.
+   | Name | Value | Required |
+   |------|-------|----------|
+   | `BOT_TOKEN` | `123456789:AA...` from BotFather | for the bot |
+   | `BYPASS_MAX_WAIT` | `12` — max seconds to sit out a shortener countdown | optional |
+   | `FLARESOLVERR_URL` | `http://flaresolverr.railway.internal:8191/v1` | optional, for Turnstile |
+   | `ENABLE_BOT` | `0` to run website-only | optional |
 
-## 4. Test it
-- Open your service → **Settings → Networking → Generate Domain** (if not already present).
-- Message your bot on Telegram. Paste any link → it replies with the real URL(s).
+   `PORT` and `RAILWAY_PUBLIC_DOMAIN` are injected automatically; the webhook
+   URL is derived from them. Set `WEBHOOK_URL` only if you use a custom domain.
 
-## Local testing (optional, polling mode)
+## 4. Verify
+```bash
+curl https://<your-domain>/healthz
+# {"ok":true,"bot":true}
+
+curl "https://<your-domain>/api/bypass?url=https://gplinks.co/ZkVCbbry"
+```
+Open `https://<your-domain>/` in a browser, and message your bot on Telegram.
+
+## 5. Optional: FlareSolverr for the hardest Cloudflare pages
+`curl_cffi` clears most Cloudflare challenges, but interactive Turnstile needs
+a real browser. In the same Railway project:
+
+1. **New → Docker Image** → `ghcr.io/flaresolverr/flaresolverr:latest`.
+2. On the bot service set
+   `FLARESOLVERR_URL=http://<flaresolverr-service>.railway.internal:8191/v1`.
+
+FlareSolverr needs ~1 GB RAM; leave it off unless links start failing.
+
+## Local run
 ```bash
 pip install -r requirements.txt
+
+# website + bot (bot polls when there's no public URL)
 export BOT_TOKEN="123456789:AA..."
+python server.py            # http://localhost:8080
+
+# website only
+ENABLE_BOT=0 python server.py
+
+# bot only, no web
 python bot.py
 ```
 
 ## Notes
-- Railway's free trial comes with a credit allowance (~$5). After it's used
-  up you'll need the Hobby plan (~$5/mo) to keep it always-on.
-- Webhook mode is the right choice here: no sleep issues, and the port
-  binding keeps Railway's health checks happy.
-- To change anything later: `railway up` or just push to the linked GitHub
-  branch and it redeploys automatically.
+- Railway's trial credit (~$5) runs out; the Hobby plan (~$5/mo) keeps it
+  always-on.
+- Health check `/healthz` returns 200 as soon as the web app is up, so a
+  Telegram outage can't fail the deploy — the bot logs the error and the
+  website keeps serving.
+- Pushing to the linked branch redeploys automatically.

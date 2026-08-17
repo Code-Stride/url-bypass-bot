@@ -4,3 +4,6 @@ requests>=2.31
 # managed "v3" challenges) + legacy JS-challenge solver.
 curl_cffi>=0.7
 cloudscraper>=1.2.71
+# Web UI + JSON API (served together with the bot from one port).
+fastapi>=0.115
+uvicorn[standard]>=0.30

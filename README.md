@@ -86,6 +86,38 @@ The engine (`unshortener.py`) uses a layered strategy:
 4. If a candidate is itself a known shortener, it recurses one level deeper.
 5. Returns all genuine destinations — mirror links included.
 
+## Two ways to run it
+
+| Entrypoint | What you get |
+|---|---|
+| `python server.py` | **Website + JSON API + Telegram bot** on one port (`$PORT`, default 8080). This is what Railway runs. |
+| `python bot.py` | Telegram bot only (polling or webhook). |
+| `python bypass_cli.py <url>` | One-off resolve from the shell. |
+
+### Web UI & API
+
+```bash
+pip install -r requirements.txt
+export BOT_TOKEN="123456789:AA..."   # optional — omit for website-only
+python server.py                     # http://localhost:8080
+```
+
+| Route | Purpose |
+|---|---|
+| `GET /` | Web UI — paste a link, get the destination |
+| `POST /api/bypass` | `{"url": "https://gplinks.co/ZkVCbbry"}` → `{"ok":true,"results":[...],"best":"..."}` |
+| `GET /api/bypass?url=…` | same, as a GET |
+| `GET /healthz` | health check |
+| `POST /telegram/<BOT_TOKEN>` | Telegram webhook (auto-registered) |
+
+```bash
+curl -X POST localhost:8080/api/bypass \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://liteshort.com/al1t"}'
+```
+
+Deployment steps for Railway are in **[DEPLOY_RAILWAY.md](DEPLOY_RAILWAY.md)**.
+
 ## Setup
 
 ### 1. Create the bot
@@ -145,6 +177,8 @@ Commands: `/start`, `/help`, `/unshort <url>` (alias `/u <url>`).
 
 | File | Purpose |
 |------|---------|
+| `server.py` | Single entrypoint: website + API + bot (used by Railway). |
+| `webapp.py` | FastAPI web UI, JSON API and Telegram webhook route. |
 | `bot.py` | Telegram bot (commands + auto-detect pasted links). |
 | `httpclient.py` | Cloudflare-capable HTTP layer (curl_cffi → cloudscraper → FlareSolverr). |
 | `adlinkfly.py` | gplinks / liteshort / AdLinkFly-clone bypass flow. |
