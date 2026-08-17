@@ -171,6 +171,84 @@ async def api_raw(url: str = "", q: str = "", ctx: int = 400, limit: int = 20):
     })
 
 
+@app.get("/api/probe")
+async def api_probe(url: str = "", q: str = "", ctx: int = 500, limit: int = 6):
+    """
+    Diagnostic: walk the chain from `url` with ONE client (so session cookies
+    and Referer are preserved), then search the landing page — and any
+    same-family <script src> it loads — for each comma-separated keyword.
+    """
+    url = (url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url'.")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    import re as _re
+    from urllib.parse import urljoin as _urljoin
+
+    from httpclient import Client
+
+    def work() -> dict:
+        client = Client()
+        first = client.get(url, allow_redirects=False)
+        hops = [url]
+        loc = None
+        if first is not None:
+            for k, v in (first.headers or {}).items():
+                if k.lower() == "location":
+                    loc = v
+                    break
+        page = client.get(loc, referer=url) if loc else first
+        if page is None:
+            return {"error": "fetch failed", "hops": hops}
+        if loc:
+            hops.append(page.url)
+        html = page.text or ""
+
+        keys = [k.strip() for k in q.split(",") if k.strip()]
+
+        def find(text: str, src: str) -> list[dict]:
+            out = []
+            for k in keys:
+                for m in list(_re.finditer(_re.escape(k), text, _re.IGNORECASE))[:limit]:
+                    out.append({
+                        "key": k, "src": src,
+                        "text": text[max(0, m.start() - ctx): m.end() + ctx],
+                    })
+            return out
+
+        hits = find(html, "page")
+
+        # Inline <script> blocks that mention a keyword are most informative.
+        scripts = _re.findall(
+            r"""<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""", html, _re.I
+        )
+        checked = []
+        for s in scripts:
+            if not any(t in s.lower() for t in ("gplink", "step", "ads", "power", "redirect", "custom")):
+                continue
+            full = s if s.startswith("http") else _urljoin(page.url, s)
+            checked.append(full)
+            r = client.get(full, referer=page.url)
+            if r is not None and r.text:
+                hits.extend(find(r.text, full))
+            if len(checked) >= 8:
+                break
+
+        return {
+            "hops": hops,
+            "final_url": page.url,
+            "length": len(html),
+            "cookies": client.cookies,
+            "scripts_checked": checked,
+            "all_scripts": scripts[:40],
+            "hits": hits[:40],
+        }
+
+    return JSONResponse(await asyncio.to_thread(work))
+
+
 @app.post("/telegram/{token}")
 async def telegram_webhook(token: str, request: Request):
     if not ENABLE_BOT or _tg_app is None or token != BOT_TOKEN:
