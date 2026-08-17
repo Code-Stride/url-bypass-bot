@@ -204,7 +204,8 @@ class BrowserEngine:
                 result.log("navigate", "opened link", url)
 
                 rounds = 0
-                while time.monotonic() < deadline and rounds < 25:
+                idle = 0
+                while time.monotonic() < deadline and rounds < 40:
                     rounds += 1
                     await _settle(page)
                     current = page.url
@@ -264,9 +265,21 @@ class BrowserEngine:
                         except Exception:  # noqa: BLE001
                             pass
 
-                    result.log("wait", "no control found; waiting for JS", current)
-                    await page.wait_for_timeout(3000)
-                    if page.url == current:
+                    # Nothing clickable yet. These pages routinely spend 15-60s
+                    # on a timer before the button appears, so keep waiting
+                    # instead of giving up after one look.
+                    idle += 1
+                    result.log(
+                        "wait",
+                        f"no control yet; waiting for JS ({idle})",
+                        current,
+                    )
+                    await page.wait_for_timeout(5000)
+                    if page.url != current:
+                        idle = 0
+                        continue
+                    if idle >= 12:  # ~60s of no progress at all
+                        result.log("error", "page never produced a control", current)
                         break
 
                 # Budget spent — fall back to the best candidate we saw.

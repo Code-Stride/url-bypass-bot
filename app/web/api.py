@@ -106,6 +106,66 @@ async def bypass_post(request: Request):
     return JSONResponse(res.to_dict(verbose=bool(body.get("verbose"))))
 
 
+@app.get("/api/inspect")
+async def inspect(url: str = "", wait: int = 12):
+    """
+    Diagnostic: open a link in the browser, wait, and report what is on the
+    page — visible buttons/links, forms, frames and the body text.  Used to
+    tune the click heuristics against a site that is actually reachable.
+    """
+    url = _clean(url)
+    from app.engines.browser import ENGINE as BROWSER
+
+    if not await BROWSER.start():
+        raise HTTPException(status_code=503, detail=f"browser: {BROWSER.error}")
+
+    context = await BROWSER._new_context()  # noqa: SLF001 - diagnostic only
+    await BROWSER._harden(context)  # noqa: SLF001
+    page = await context.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(max(0, min(wait, 60)) * 1000)
+        info = await page.evaluate(
+            """() => {
+              const vis = e => {
+                const r = e.getBoundingClientRect();
+                const s = getComputedStyle(e);
+                return r.width > 0 && r.height > 0 &&
+                       s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const pick = sel => [...document.querySelectorAll(sel)]
+                .slice(0, 60).map(e => ({
+                  tag: e.tagName.toLowerCase(),
+                  id: e.id || '',
+                  cls: (e.className && e.className.toString
+                        ? e.className.toString() : '').slice(0, 80),
+                  text: (e.innerText || e.value || '').trim().slice(0, 60),
+                  href: e.href || '',
+                  visible: vis(e),
+                }));
+              return {
+                title: document.title,
+                url: location.href,
+                buttons: pick('button, input[type=submit], a'),
+                forms: [...document.forms].slice(0, 10).map(f => ({
+                  id: f.id, action: f.action, method: f.method,
+                  fields: [...f.elements].slice(0, 15)
+                    .map(i => i.name).filter(Boolean),
+                })),
+                frames: [...document.querySelectorAll('iframe')]
+                  .slice(0, 10).map(f => f.src),
+                text: (document.body.innerText || '').slice(0, 1500),
+              };
+            }"""
+        )
+        info["frame_urls"] = [f.url for f in page.frames][:10]
+        return JSONResponse(info)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)[:300])
+    finally:
+        await context.close()
+
+
 @app.post("/telegram/{token}")
 async def telegram_webhook(token: str, request: Request):
     if _tg is None or token != config.BOT_TOKEN:
