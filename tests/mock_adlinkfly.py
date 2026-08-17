@@ -86,6 +86,31 @@ class Handler(BaseHTTPRequestHandler):
         if self._challenge_if_needed():
             return
 
+        # Variant B (the live gplinks flow): redirect carries NO parameters;
+        # the ad blog plants lid/pid/vid/pages as *raw* cookies instead.
+        if path.startswith("/c/"):
+            code = path[3:]
+            self._send(
+                302, b"",
+                extra={"Location": f"http://localhost:{self.server.server_address[1]}/blog/"},
+            )
+            return
+
+        if path.startswith("/blog"):
+            cookies = [
+                "lid=ZkVCbbry", "pid=1093510", "vid=MTA0NjUxODg5NQ",
+                "pages=5", "step_count=0", "imps=0",
+            ]
+            body = b"<html><head><title>skrresults</title></head><body>blog</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            for c in cookies:
+                self.send_header("Set-Cookie", c + "; Path=/")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path.startswith("/i/"):
             code = path[3:]
             lid, pid = _b64url(code), _b64url("194570")

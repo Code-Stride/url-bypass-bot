@@ -68,6 +68,17 @@ def test_interstitial_rebuild() -> None:
           out == "https://gplinks.co/gPxzXmyD?pid=194570&vid=993862", str(out))
 
 
+def test_cookie_interstitial_params() -> None:
+    """The live gplinks/skrresults variant: raw values in cookies, no query."""
+    cookies = {
+        "lid": "ZkVCbbry", "pid": "1093510",
+        "vid": "MTA0NjUxODg5NQ", "pages": "5",
+    }
+    out = adlinkfly.interstitial_targets("https://skrresults.com/", cookies, "gplinks.co")
+    expected = "https://gplinks.co/ZkVCbbry?pid=1093510&vid=MTA0NjUxODg5NQ"
+    check("cookie lid kept raw (not base64-decoded)", out and out[0] == expected, str(out))
+
+
 def test_full_flow(port: int) -> None:
     base = f"http://127.0.0.1:{port}"
     adlinkfly.ADLINKFLY_HOSTS.add("127.0.0.1")
@@ -79,6 +90,11 @@ def test_full_flow(port: int) -> None:
     # interstitial flow: /i/<code> -> ad blog (lid/pid/vid) -> real page
     dest2 = adlinkfly.bypass(f"{base}/i/ZkVCbbry", Client())
     check("interstitial short link bypassed", dest2 == mock_adlinkfly.DESTINATION, str(dest2))
+
+    # live-style flow: 302 to an ad blog with NO params; the blog sets
+    # lid/pid/vid cookies which rebuild the real gplinks URL.
+    dest3 = adlinkfly.bypass(f"{base}/c/ZkVCbbry", Client())
+    check("cookie-based interstitial bypassed", dest3 == mock_adlinkfly.DESTINATION, str(dest3))
 
     # through the public engine
     import unshortener
@@ -96,6 +112,7 @@ def main() -> int:
         test_field_extraction()
         test_host_matching()
         test_interstitial_rebuild()
+        test_cookie_interstitial_params()
         test_full_flow(port)
     finally:
         srv.shutdown()

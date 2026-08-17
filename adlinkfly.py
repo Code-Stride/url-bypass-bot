@@ -151,40 +151,91 @@ def _b64url_decode(s: str) -> str:
         return s
 
 
-def _params_from(url: str, cookies: dict[str, str]) -> dict[str, str]:
-    """Collect lid/pid/vid/pages from the query string and from cookies."""
+_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{4,32}$")
+
+
+def _params_from(url: str, cookies: dict[str, str]) -> dict[str, tuple[str, str]]:
+    """
+    Collect lid/pid/vid/pages, remembering where each value came from.
+
+    The two live variants differ in encoding:
+      * query string (powergam-style ?lid=…&pid=…) -> values are base64url
+      * cookies (skrresults-style, set by the ad blog) -> values are raw
+    so the source decides whether to decode.
+    """
     q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items() if v}
-    out = {}
+    out: dict[str, tuple[str, str]] = {}
     for key in ("lid", "pid", "vid", "pages"):
-        val = q.get(key) or cookies.get(key) or ""
-        if val:
-            out[key] = val
+        if q.get(key):
+            out[key] = (q[key], "query")
+        elif cookies.get(key):
+            out[key] = (cookies[key], "cookie")
+    return out
+
+
+def _code_candidates(lid: str, source: str) -> list[str]:
+    """Possible short codes for a lid, best guess first."""
+    cands: list[str] = []
+    if source == "cookie":
+        # Cookies hold the raw code (lid=ZkVCbbry); decoding it yields junk.
+        cands.append(lid)
+        dec = _b64url_decode(lid)
+        if dec != lid:
+            cands.append(dec)
+    else:
+        dec = _b64url_decode(lid)
+        if dec != lid:
+            cands.append(dec)
+        cands.append(lid)
+    out = []
+    for c in cands:
+        c = (c or "").strip()
+        if c and _CODE_RE.match(c) and c not in out:
+            out.append(c)
     return out
 
 
 def interstitial_target(
-    url: str, cookies: dict[str, str], origin_host: str, scheme: str = "https"
+    url: str,
+    cookies: dict[str, str],
+    origin_host: str,
+    scheme: str = "https",
 ) -> str | None:
     """
     Rebuild the real AdLinkFly URL from an ad-blog interstitial's parameters,
     skipping the whole "Step 1 of N / CONTINUE" ad walk.
     """
+    targets = interstitial_targets(url, cookies, origin_host, scheme)
+    return targets[0] if targets else None
+
+
+def interstitial_targets(
+    url: str,
+    cookies: dict[str, str],
+    origin_host: str,
+    scheme: str = "https",
+) -> list[str]:
+    """All plausible rebuilt URLs (raw vs base64-decoded lid), best first."""
     p = _params_from(url, cookies)
-    lid = p.get("lid")
-    if not lid:
-        return None
-    code = _b64url_decode(lid)
-    if not code or "/" in code:
-        return None
-    pid = _b64url_decode(p.get("pid", ""))
-    vid = p.get("vid", "")
+    if "lid" not in p:
+        return []
+    lid, lid_src = p["lid"]
+
+    pid_val, pid_src = p.get("pid", ("", "cookie"))
+    pid = pid_val if pid_src == "cookie" else _b64url_decode(pid_val)
+    vid = p.get("vid", ("", ""))[0]
+
     q = []
     if pid:
         q.append(f"pid={pid}")
     if vid:
         q.append(f"vid={vid}")
     tail = ("?" + "&".join(q)) if q else ""
-    return f"{scheme}://{origin_host}/{code}{tail}"
+
+    return [
+        f"{scheme}://{origin_host}/{code}{tail}"
+        for code in _code_candidates(lid, lid_src)
+    ]
 
 
 def _post_links_go(
@@ -222,6 +273,34 @@ def _post_links_go(
     return None
 
 
+def _unlock_page(
+    client: Client, page_url: str, origin: str, referer: str
+) -> str | None:
+    """Load an AdLinkFly unlock page and POST its #go-link form."""
+    page = client.get(page_url, referer=referer)
+    if page is None:
+        return None
+    html = page.text or ""
+    if not looks_like_adlinkfly(html):
+        return None
+    fields = extract_go_link_fields(html)
+    if not fields:
+        return None
+    polite_sleep(detect_countdown(html, 8.0))
+    return _post_links_go(client, origin, fields, referer=page.url)
+
+
+def _try_targets(
+    client: Client, targets: list[str], origin: str, origin_host: str
+) -> str | None:
+    """Try each rebuilt AdLinkFly URL until one unlocks."""
+    for t in targets:
+        dest = _unlock_page(client, t, origin, referer=origin + "/")
+        if dest and host_of(dest) != origin_host:
+            return dest
+    return None
+
+
 def bypass(url: str, client: Client | None = None, _depth: int = 0) -> str | None:
     """
     Resolve one AdLinkFly short link (gplinks / liteshort / clone) to its
@@ -253,12 +332,30 @@ def bypass(url: str, client: Client | None = None, _depth: int = 0) -> str | Non
         if loc_host == origin_host:
             target = loc
         else:
-            # Bounced to an ad-blog interstitial: rebuild the real URL.
-            rebuilt = interstitial_target(
+            # Bounced off-site.  This is either an ad-blog interstitial or a
+            # genuine destination — the parameters decide which.
+            rebuilt = interstitial_targets(
                 loc, client.cookies, parsed.netloc, scheme
             )
+            if not rebuilt:
+                # The live gplinks flow redirects with NO query params: the
+                # ad blog plants lid/pid/vid as cookies in its own response,
+                # so we must load it before we can read them.
+                blog = client.get(loc, referer=origin + "/")
+                blog_url = blog.url if blog is not None else loc
+                rebuilt = interstitial_targets(
+                    blog_url, client.cookies, parsed.netloc, scheme
+                )
+                if not rebuilt and blog is not None:
+                    # Ad blog running AdLinkFly itself? Unlock it in place.
+                    if looks_like_adlinkfly(blog.text):
+                        return bypass(blog.url, client, _depth + 1)
+
             if rebuilt:
-                target = rebuilt
+                dest = _try_targets(client, rebuilt, origin, origin_host)
+                if dest:
+                    return dest
+                target = rebuilt[0]
             elif is_adlinkfly_host(loc):
                 return bypass(loc, client, _depth + 1)
             else:
