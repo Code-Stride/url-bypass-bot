@@ -80,6 +80,27 @@ def _clean(url: str) -> str:
     return url
 
 
+@app.get("/version")
+async def version():
+    """Which commit is actually running — makes deploy state verifiable."""
+    import os as _os
+    import subprocess as _sp
+
+    rev = _os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
+    if not rev:
+        try:
+            rev = _sp.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], text=True, timeout=5
+            ).strip()
+        except Exception:  # noqa: BLE001
+            rev = "unknown"
+    return {
+        "commit": rev[:12],
+        "browser_headless": config.BROWSER_HEADLESS,
+        "stop_threshold": 0.85,
+    }
+
+
 @app.get("/healthz")
 async def healthz():
     browser_ok = False
