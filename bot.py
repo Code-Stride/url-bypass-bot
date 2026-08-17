@@ -48,8 +48,10 @@ WELCOME = (
     "destination — no ads, no captcha, no waiting.\n\n"
     "👉 Just send me a link, or use:\n"
     "<code>/unshort https://example.short/xyz</code>\n\n"
-    "I support classic shorteners (bit.ly, is.gd, tinyurl...) and "
-    "link-protection services (linkszilla, mobilejsr, adf.ly-style, etc.)."
+    "I support classic shorteners (bit.ly, is.gd, tinyurl...), "
+    "link-protection services (linkszilla, mobilejsr, adf.ly-style, etc.) and "
+    "AdLinkFly sites behind Cloudflare — <b>gplinks.co</b>, <b>liteshort.com</b>, "
+    "adrinolinks and clones."
 )
 
 

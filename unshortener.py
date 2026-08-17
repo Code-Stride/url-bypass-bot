@@ -22,6 +22,9 @@ from urllib.parse import quote, urljoin, urlparse
 
 import requests
 
+import adlinkfly
+from httpclient import Client, is_cloudflare_challenge
+
 TIMEOUT = 15
 MAX_DEPTH = 5
 
@@ -134,17 +137,36 @@ _CSRF_NAMES = {
 
 _session = requests.Session()
 
+# Cloudflare-capable HTTP layer (curl_cffi -> cloudscraper -> FlareSolverr).
+_client = Client()
+
 
 def _get(url: str) -> requests.Response | None:
-    """Fetch a URL following redirects, with a browser-like UA."""
+    """
+    Fetch a URL following redirects.
+
+    Uses the Cloudflare-capable client first (real Chrome TLS fingerprint) and
+    falls back to plain requests, then wraps the result in a requests-like
+    object so the rest of this module keeps working unchanged.
+    """
+    resp = _client.get(url)
+    if resp is not None and resp.ok and not is_cloudflare_challenge(resp):
+        shim = requests.Response()
+        shim.status_code = resp.status_code
+        shim.url = resp.url
+        shim.headers.update(resp.headers or {})
+        shim._content = (resp.text or "").encode("utf-8", "replace")
+        shim.encoding = "utf-8"
+        if "content-type" not in {k.lower() for k in shim.headers}:
+            shim.headers["Content-Type"] = "text/html"
+        return shim
     try:
-        resp = _session.get(
+        return _session.get(
             url,
             headers=HEADERS,
             timeout=TIMEOUT,
             allow_redirects=True,
         )
-        return resp
     except requests.RequestException:
         return None
 
@@ -152,7 +174,7 @@ def _get(url: str) -> requests.Response | None:
 def _host(url: str) -> str:
     h = (urlparse(url).hostname or "").lower()
     if h.startswith("www."):
-        h = h[3:]
+        h = h[4:]
     return h
 
 
@@ -433,6 +455,21 @@ def resolve(url: str, depth: int = 0, seen: set[str] | None = None) -> list[str]
         return []
     seen.add(url)
 
+    # --- AdLinkFly family (gplinks.co, liteshort.com, adrinolinks, …) ------
+    # These need a dedicated flow: visitor-id hop -> #go-link form ->
+    # POST /links/go.  Try it before the generic HTML scraping.
+    if adlinkfly.is_adlinkfly_host(url):
+        try:
+            dest = adlinkfly.bypass(url)
+        except Exception:  # noqa: BLE001 - never let one site break the engine
+            dest = None
+        if dest:
+            if _is_shortener(dest) and dest not in seen:
+                deeper = resolve(dest, depth + 1, seen)
+                if deeper:
+                    return deeper
+            return [dest]
+
     resp = _get(url)
     if resp is None:
         return []
@@ -462,6 +499,16 @@ def resolve(url: str, depth: int = 0, seen: set[str] | None = None) -> list[str]
         if _is_noise(final_url):
             return []
         return [final_url]
+
+    # An unknown host can still be running the AdLinkFly script — detect it
+    # from the page structure (#go-link form / links/go endpoint).
+    if adlinkfly.looks_like_adlinkfly(html):
+        try:
+            dest = adlinkfly.bypass(final_url)
+        except Exception:  # noqa: BLE001
+            dest = None
+        if dest:
+            return [dest]
 
     # SafelinkU / khaddavi redirect chain -> skip straight to /ready/go.
     if own_host in SAFELINK_HOSTS:

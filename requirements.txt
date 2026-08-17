@@ -1,2 +1,6 @@
 python-telegram-bot>=21.0
 requests>=2.31
+# Cloudflare handling: real Chrome TLS/HTTP2 fingerprint (clears most
+# managed "v3" challenges) + legacy JS-challenge solver.
+curl_cffi>=0.7
+cloudscraper>=1.2.71

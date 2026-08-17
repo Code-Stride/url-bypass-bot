@@ -8,8 +8,70 @@ It handles two kinds of links:
 
 1. **Classic shorteners** — `bit.ly`, `tinyurl.com`, `is.gd`, `goo.gl`, `t.co`, `cutt.ly`, …
 2. **Link-protection / "earn money" shorteners** — `linkszilla.top`, `mobilejsr.com`,
-   `adf.ly`, `ouo.io`, `shrinkme.io`, `linkvertise.com`, `gplinks.co`, and many more
+   `adf.ly`, `ouo.io`, `shrinkme.io`, `linkvertise.com`, and many more
    (a large built-in list, easy to extend).
+3. **AdLinkFly sites behind Cloudflare** — `gplinks.co`, `liteshort.com`,
+   `link.liteshort.com`, `adrinolinks.*`, `shortnest.com`, `exe.io`, `fc.lc`, … —
+   handled by a dedicated flow (see below).
+
+## gplinks / liteshort (AdLinkFly) + Cloudflare
+
+These sites all run the same PHP script and sit behind Cloudflare, so two
+problems have to be solved:
+
+**1. Cloudflare (`httpclient.py`).** Cloudflare fingerprints the TLS
+ClientHello (JA3/JA4), the HTTP/2 settings and the header order — a Chrome
+User-Agent on Python's TLS stack is flagged instantly. The client escalates:
+
+| Backend | Clears | Notes |
+|---|---|---|
+| `curl_cffi` (impersonates Chrome) | TLS/JA3 checks + most managed "v3" JS challenges | default, no setup |
+| `cloudscraper` | legacy IUAM JS challenge | automatic fallback |
+| **FlareSolverr** (real headless browser) | Turnstile / interactive challenges | opt-in, see below |
+
+Cookies (including `cf_clearance`) are shared across backends, so once the
+challenge is cleared the follow-up `POST /links/go` reuses the clearance.
+
+For the hardest pages, run a browser solver and point the bot at it:
+
+```bash
+docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+export FLARESOLVERR_URL=http://localhost:8191/v1
+```
+
+**2. The AdLinkFly unlock flow (`adlinkfly.py`).**
+
+```
+GET  https://gplinks.co/ZkVCbbry
+  -> 302 …?vid=<visitor id>              (or an ad-blog interstitial)
+GET  https://gplinks.co/ZkVCbbry?vid=…
+  -> page with <form id="go-link"> holding _token + ad_form_data + a countdown
+wait out the countdown (capped by BYPASS_MAX_WAIT)
+POST https://gplinks.co/links/go   (X-Requested-With: XMLHttpRequest)
+  -> {"status":"success","url":"https://real-destination/…"}
+```
+
+Newer gplinks links bounce through an ad blog (`powergam.online`-style) whose
+URL/cookies carry `lid`, `pid`, `pages`, `vid`. Instead of walking the
+"Step 1 of 2 → CONTINUE" ads, the bypass base64url-decodes `lid`/`pid` and
+jumps straight to `https://gplinks.co/<lid>?pid=<pid>&vid=<vid>`.
+
+### Try it from the shell
+
+```bash
+pip install -r requirements.txt
+python bypass_cli.py https://liteshort.com/al1t https://gplinks.co/ZkVCbbry
+python bypass_cli.py --debug https://gplinks.co/ZkVCbbry   # show backend used
+```
+
+### Env knobs
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FLARESOLVERR_URL` | – | headless-browser solver endpoint for Turnstile |
+| `BYPASS_MAX_WAIT` | `12` | max seconds to sit out a countdown |
+| `BYPASS_TIMEOUT` | `25` | per-request timeout |
+| `BYPASS_IMPERSONATE` | `chrome` | curl_cffi browser profile |
 
 ## How it works
 
@@ -84,6 +146,10 @@ Commands: `/start`, `/help`, `/unshort <url>` (alias `/u <url>`).
 | File | Purpose |
 |------|---------|
 | `bot.py` | Telegram bot (commands + auto-detect pasted links). |
+| `httpclient.py` | Cloudflare-capable HTTP layer (curl_cffi → cloudscraper → FlareSolverr). |
+| `adlinkfly.py` | gplinks / liteshort / AdLinkFly-clone bypass flow. |
+| `bypass_cli.py` | Resolve links from the command line. |
+| `tests/` | Offline tests against a local mock of the AdLinkFly protocol. |
 | `unshortener.py` | The resolution engine (library — usable without Telegram). |
 | `test_unshortener.py` | Quick CLI test of the engine. |
 | `requirements.txt` | Python dependencies. |
