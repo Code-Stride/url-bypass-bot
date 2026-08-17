@@ -16,6 +16,7 @@ import asyncio
 import time
 
 from app import config
+from app import cookies as cookiejar
 from app.classify import host_of, is_shortener, verdict
 from app.engines import http as http_engine
 from app.models import Result
@@ -23,7 +24,9 @@ from app.models import Result
 MAX_CHAIN = 4
 
 
-async def resolve(url: str, use_browser: bool | None = None) -> Result:
+async def resolve(
+    url: str, use_browser: bool | None = None, cookies: str = ""
+) -> Result:
     """Resolve one link to its real destination."""
     started = time.monotonic()
     url = (url or "").strip()
@@ -36,6 +39,9 @@ async def resolve(url: str, use_browser: bool | None = None) -> Result:
         result.input = url
 
     want_browser = config.USE_BROWSER if use_browser is None else use_browser
+    jar = cookiejar.load(cookies, url)
+    if jar:
+        result.log("api", "using " + cookiejar.summarise(jar))
     chain_seen: set[str] = set()
     current = url
     final: Result | None = None
@@ -49,7 +55,7 @@ async def resolve(url: str, use_browser: bool | None = None) -> Result:
         hop.steps = result.steps  # share the log so the user sees one story
 
         # 1. cheap path
-        await asyncio.to_thread(http_engine.ENGINE.resolve, current, hop)
+        await asyncio.to_thread(http_engine.ENGINE.resolve, current, hop, jar)
 
         # 2. real browser
         if not hop.ok and want_browser:
@@ -58,7 +64,7 @@ async def resolve(url: str, use_browser: bool | None = None) -> Result:
             hop = Result(input=current)
             hop.steps = result.steps
             hop.candidates = result.candidates
-            await BROWSER.resolve(current, hop)
+            await BROWSER.resolve(current, hop, jar)
 
         result.candidates = list(dict.fromkeys(result.candidates + hop.candidates))
 
@@ -100,10 +106,12 @@ async def resolve(url: str, use_browser: bool | None = None) -> Result:
     return out
 
 
-async def resolve_with_timeout(url: str, use_browser: bool | None = None) -> Result:
+async def resolve_with_timeout(
+    url: str, use_browser: bool | None = None, cookies: str = ""
+) -> Result:
     try:
         return await asyncio.wait_for(
-            resolve(url, use_browser), timeout=config.RESOLVE_TIMEOUT
+            resolve(url, use_browser, cookies), timeout=config.RESOLVE_TIMEOUT
         )
     except asyncio.TimeoutError:
         r = Result(input=url)

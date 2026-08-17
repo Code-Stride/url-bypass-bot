@@ -90,6 +90,36 @@ python cli.py --verbose --no-browser https://bit.ly/xyz
 `verbose=true` adds `steps` — every navigation, wait and click — so a
 failure can be diagnosed instead of guessed at.
 
+## Using your own cookies
+
+Some blocks are about *identity*, not code. You can lend the server a session
+from your own browser:
+
+**Web UI** — tick “use my cookies”, paste the export.
+**API** — add a `cookies` field (or `?cookies=` on GET).
+**Server-wide** — set `COOKIES_FILE=/path/cookies.txt` or `COOKIES_JSON='[…]'`.
+
+Accepted: Netscape `cookies.txt`, Cookie-Editor / EditThisCookie JSON,
+Playwright `storage_state`, or a plain `name=value; name2=value2` string.
+
+```bash
+curl -X POST https://<domain>/api/bypass \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://gplinks.co/ZkVCbbry","cookies":"AppSession=…; csrfToken=…"}'
+```
+
+### What cookies actually fix
+
+| Situation | Helps? |
+|---|---|
+| Interstitial bounces you to a Google “unusual traffic” captcha | ✅ reuses your solved session |
+| Shortener session state (`AppSession`, `csrfToken`, `PHPSESSID`, `lid/pid/vid`) | ✅ the flow starts recognised |
+| Consent / age / region gate | ✅ |
+| Cloudflare `cf_clearance` | ⚠️ usually **no** — bound to the IP **and** UA that solved it, so a cookie from your PC fails from Railway. Works only if the server shares that IP (same proxy). |
+| Hard origin block (gplinks' `403 Forbidden`) | ❌ refused before cookies are read — needs a different IP |
+
+Cookie **values are never logged** — only counts and domains appear in the step trail.
+
 ## Deploy to Railway
 
 The `Dockerfile` is based on Microsoft's Playwright image, so Chromium and
@@ -114,6 +144,8 @@ Give the service ~1 GB RAM; each concurrent browser costs ~250 MB
 | `USE_BROWSER` | `1` | `0` = HTTP only (much less accurate) |
 | `BROWSER_CONCURRENCY` | `2` | parallel browser resolutions |
 | `RESOLVE_TIMEOUT` | `180` | total budget per link (s) |
+| `COOKIES_FILE` | – | cookies.txt / JSON export applied to every request |
+| `COOKIES_JSON` | – | same, inline |
 | `BROWSER_TIMEOUT` | `150` | browser budget per link (s) |
 
 ## Telegram commands
@@ -126,6 +158,7 @@ the last link was solved.
 | Path | Purpose |
 |---|---|
 | `app/classify.py` | decides destination vs shortener vs noise — the accuracy backbone |
+| `app/cookies.py` | parses cookies.txt / JSON / header exports, feeds both engines |
 | `app/resolver.py` | runs the engines, re-verifies, follows shortener chains |
 | `app/engines/http.py` | fast path; bails out at gates |
 | `app/engines/browser.py` | Playwright engine that does the real flow |

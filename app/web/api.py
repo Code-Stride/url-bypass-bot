@@ -112,8 +112,8 @@ async def healthz():
 
 
 @app.get("/api/bypass")
-async def bypass_get(url: str = "", verbose: bool = False):
-    res = await resolve_with_timeout(_clean(url))
+async def bypass_get(url: str = "", verbose: bool = False, cookies: str = ""):
+    res = await resolve_with_timeout(_clean(url), cookies=cookies)
     return JSONResponse(res.to_dict(verbose=verbose))
 
 
@@ -123,7 +123,10 @@ async def bypass_post(request: Request):
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
-    res = await resolve_with_timeout(_clean(str(body.get("url", ""))))
+    res = await resolve_with_timeout(
+        _clean(str(body.get("url", ""))),
+        cookies=str(body.get("cookies", "") or ""),
+    )
     return JSONResponse(res.to_dict(verbose=bool(body.get("verbose"))))
 
 

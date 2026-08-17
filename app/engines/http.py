@@ -15,7 +15,7 @@ from urllib.parse import urljoin
 
 import requests
 
-from app import config
+from app import config, cookies as cookiejar
 from app.classify import host_of, is_error_url, is_shortener, pick_best, verdict
 from app.models import Result
 
@@ -67,16 +67,21 @@ class HttpEngine:
                 pass
         return requests.Session(), False
 
-    def resolve(self, url: str, result: Result) -> Result:
+    def resolve(
+        self, url: str, result: Result, cookies: list | None = None
+    ) -> Result:
         """Follow the chain; return a destination only if we are confident."""
         sess, impersonating = self._session()
+        self._cookies = cookies or []
         origin_host = host_of(url)
         current = url
 
         for hop in range(MAX_HOPS):
             try:
+                jar = cookiejar.for_domain(self._cookies, current)
                 resp = sess.get(
                     current,
+                    cookies=jar or None,
                     headers=BASE_HEADERS,
                     timeout=config.HTTP_TIMEOUT,
                     allow_redirects=False,

@@ -51,6 +51,15 @@ INDEX_HTML = """<!doctype html>
   .meta { color:#64748b; font-size:12px; margin-top:6px; }
   .steps { margin-top:8px; font-size:12px; color:#64748b; line-height:1.7;
            max-height:220px; overflow:auto; }
+  textarea {
+    display:none; width:100%; margin-top:10px; min-height:88px; padding:11px 12px;
+    border-radius:11px; border:1px solid #26344b; background:#060b16;
+    color:#e2e8f0; font-size:12.5px; font-family:ui-monospace,SFMono-Regular,monospace;
+    resize:vertical; outline:none;
+  }
+  textarea:focus { border-color:#38bdf8; }
+  .hint { display:none; margin-top:7px; font-size:11.5px; color:#64748b; line-height:1.6; }
+  .hint code { background:#0f172a; padding:2px 5px; border-radius:5px; }
   .examples { margin-top:18px; font-size:12.5px; color:#64748b; line-height:2; }
   .examples code { background:#0f172a; padding:3px 7px; border-radius:6px;
                    cursor:pointer; color:#94a3b8; }
@@ -75,7 +84,16 @@ INDEX_HTML = """<!doctype html>
     <input id="u" type="url" placeholder="https://gplinks.co/ZkVCbbry" required>
     <button id="go" type="submit">Bypass</button>
   </form>
-  <label class="row"><input type="checkbox" id="v"> show what it did</label>
+  <div class="row">
+    <label><input type="checkbox" id="v"> show what it did</label>
+    <label><input type="checkbox" id="ck"> use my cookies</label>
+  </div>
+  <textarea id="cookies" placeholder="Paste cookies — cookies.txt, a Cookie-Editor JSON export, or  name=value; name2=value2"></textarea>
+  <div class="hint" id="ckhint">
+    Lends this server your browser session. Fixes “unusual traffic” captcha
+    bounces; Cloudflare's <code>cf_clearance</code> is tied to the IP that
+    solved it, so it usually won't carry over from your PC.
+  </div>
   <div class="bar" id="bar"><i></i></div>
 
   <div id="out"></div>
@@ -96,6 +114,14 @@ const bar = document.getElementById('bar');
 
 document.querySelectorAll('.ex').forEach(e => e.onclick = () => inp.value = e.textContent);
 
+const ck = document.getElementById('ck');
+const ckBox = document.getElementById('cookies');
+const ckHint = document.getElementById('ckhint');
+ck.onchange = () => {
+  const on = ck.checked ? 'block' : 'none';
+  ckBox.style.display = on; ckHint.style.display = on;
+};
+
 const esc = s => String(s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -113,7 +139,10 @@ document.getElementById('f').onsubmit = async ev => {
   try {
     const r = await fetch('/api/bypass', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ url: inp.value, verbose })
+      body: JSON.stringify({
+        url: inp.value, verbose,
+        cookies: ck.checked ? ckBox.value : ''
+      })
     });
     const d = await r.json();
     if (!d.ok) {

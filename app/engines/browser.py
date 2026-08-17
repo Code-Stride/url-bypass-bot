@@ -28,7 +28,7 @@ import asyncio
 import re
 import time
 
-from app import config
+from app import config, cookies as cookiejar
 from app.classify import (
     host_of,
     is_error_url,
@@ -253,7 +253,9 @@ class BrowserEngine:
         return None
 
     # -- main flow ---------------------------------------------------------
-    async def resolve(self, url: str, result: Result) -> Result:
+    async def resolve(
+        self, url: str, result: Result, cookies: list | None = None
+    ) -> Result:
         if not await self.start():
             return result.fail(f"browser unavailable ({self.error})")
 
@@ -263,6 +265,12 @@ class BrowserEngine:
         async with self._sem:
             context = await self._new_context()
             await self._harden(context)
+            if cookies:
+                try:
+                    await context.add_cookies(cookies)
+                    result.log("api", "loaded " + cookiejar.summarise(cookies))
+                except Exception as exc:  # noqa: BLE001
+                    result.log("error", f"cookies rejected: {str(exc)[:120]}")
             page = await context.new_page()
 
             # Ads open extra tabs; close them so the flow stays on one page.

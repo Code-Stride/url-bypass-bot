@@ -9,6 +9,7 @@ as an answer, while devuploads.com must be recognised as a true destination.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 
@@ -93,6 +94,43 @@ def test_live_regressions() -> None:
     check("'Get Link' is still clicked", not AVOID_TEXT_RE.match("Get Link"))
 
 
+def test_cookies() -> None:
+    from app import cookies as cj
+
+    netscape = (
+        "# Netscape HTTP Cookie File\n"
+        ".gplinks.co\tTRUE\t/\tTRUE\t1900000000\tAppSession\tabc123\n"
+        "#HttpOnly_.google.com\tTRUE\t/\tTRUE\t1900000000\tNID\txyz\n"
+    )
+    got = cj.parse(netscape)
+    check("netscape cookies parsed", len(got) == 2, str([c["name"] for c in got]))
+    check("httponly line kept", any(c["name"] == "NID" for c in got))
+
+    js = json.dumps([{"name": "cf_clearance", "value": "v1",
+                      "domain": ".gplinks.co", "path": "/", "secure": True,
+                      "expirationDate": 1900000000}])
+    got = cj.parse(js)
+    check("json cookies parsed",
+          got and got[0]["name"] == "cf_clearance"
+          and got[0]["domain"] == ".gplinks.co", str(got))
+
+    storage = json.dumps({"cookies": [
+        {"name": "a", "value": "1", "domain": "x.com", "path": "/"}]})
+    check("playwright storage_state parsed", len(cj.parse(storage)) == 1)
+
+    hdr = cj.parse("PHPSESSID=abc; lid=ZkVCbbry", "gplinks.co")
+    check("header string parsed",
+          len(hdr) == 2 and hdr[0]["domain"] == ".gplinks.co", str(hdr))
+
+    picked = cj.for_domain(cj.parse(netscape), "https://www.gplinks.co/x")
+    check("for_domain filters by host", picked == {"AppSession": "abc123"},
+          str(picked))
+
+    check("garbage ignored", cj.parse("!!! not cookies !!!") == [])
+    check("cookie values never logged",
+          "abc123" not in cj.summarise(cj.parse(netscape)))
+
+
 def test_result_model() -> None:
     r = Result(input="u")
     r.log("navigate", "x")
@@ -125,6 +163,7 @@ def main() -> int:
     try:
         test_classifier()
         test_live_regressions()
+        test_cookies()
         test_result_model()
         test_http_engine(port)
         test_no_false_positive(port)
