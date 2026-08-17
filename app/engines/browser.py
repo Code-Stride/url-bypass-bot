@@ -290,12 +290,20 @@ class BrowserEngine:
                         seen.append(current)
                         result.log("navigate", f"page {rounds}", current)
 
-                    # Reached a credible destination?
+                    # Reached a credible destination?  Only stop on strong
+                    # evidence (known file host or a direct file URL): a
+                    # merely "unknown host with a path" is usually the NEXT
+                    # gate in the chain, e.g. liteshort -> .../zip.php.
                     ok, conf, why = verdict(current, origin_host, visited)
-                    if ok and conf >= 0.6 and not is_shortener(current):
+                    if ok and conf >= 0.85 and not is_shortener(current):
                         result.candidates.append(current)
                         result.log("redirect", f"destination reached ({why})", current)
                         return result.succeed(current, "browser", min(0.99, conf + 0.05))
+                    if ok and conf >= 0.55:
+                        # Plausible but unproven — remember it as a fallback
+                        # and keep walking the flow.
+                        if current not in result.candidates:
+                            result.candidates.append(current)
 
                     if is_error_url(current):
                         result.log("error", "shortener returned an error page", current)
@@ -309,6 +317,18 @@ class BrowserEngine:
                         body = (await page.inner_text("body"))[:4000]
                     except Exception:  # noqa: BLE001
                         pass
+
+                    # Hard block from the origin (datacenter IP banned).
+                    if rounds <= 2 and re.match(
+                        r"^\s*(?:403 forbidden|access denied|error 1006|"
+                        r"you have been blocked)", body, re.IGNORECASE
+                    ):
+                        result.log("error", "origin blocked this server", current)
+                        return result.fail(
+                            "the shortener blocked this server's IP (403). "
+                            "Datacenter IPs are often banned — run it behind a "
+                            "residential proxy or FlareSolverr."
+                        )
 
                     wait_s = self._countdown_seconds(body)
                     if wait_s:
