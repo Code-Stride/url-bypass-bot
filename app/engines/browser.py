@@ -67,6 +67,52 @@ CLICK_SELECTORS = [
 
 _COUNTDOWN_TEXT_RE = re.compile(r"(\d{1,3})\s*(?:second|sec\b|s\b)", re.IGNORECASE)
 
+# Cloudflare interstitial titles/bodies ("v3" managed challenge & Turnstile).
+CF_RE = re.compile(
+    r"(just a moment|one moment, please|checking your browser|"
+    r"verify you are human|please wait while your request is being verified|"
+    r"enable javascript and cookies)",
+    re.IGNORECASE,
+)
+
+
+async def _pass_cloudflare(page, result, budget: float = 45.0) -> bool:
+    """
+    Sit on a Cloudflare interstitial until it clears, clicking the Turnstile
+    checkbox if one is shown.  Returns True if the page moved on.
+    """
+    import time as _t
+
+    end = _t.monotonic() + budget
+    announced = False
+    while _t.monotonic() < end:
+        try:
+            title = (await page.title()) or ""
+            body = (await page.inner_text("body"))[:600]
+        except Exception:  # noqa: BLE001
+            return True  # navigated away mid-read
+        if not CF_RE.search(title + " " + body):
+            return True
+        if not announced:
+            result.log("wait", "Cloudflare challenge — solving", page.url)
+            announced = True
+
+        # Turnstile renders in a cross-origin iframe; click its checkbox.
+        for fr in page.frames:
+            if "challenges.cloudflare.com" not in (fr.url or ""):
+                continue
+            for sel in ("input[type=checkbox]", "#checkbox", "label"):
+                try:
+                    el = fr.locator(sel).first
+                    if await el.count():
+                        await el.click(timeout=2500)
+                        result.log("click", "Turnstile checkbox")
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+        await page.wait_for_timeout(2500)
+    return False
+
 
 class BrowserEngine:
     """Owns one Chromium instance shared by all resolutions."""
@@ -96,8 +142,12 @@ class BrowserEngine:
                         "--disable-blink-features=AutomationControlled",
                         "--disable-popup-blocking",
                         "--no-first-run",
+                        "--no-default-browser-check",
                         "--mute-audio",
+                        "--window-size=1366,768",
+                        "--disable-features=IsolateOrigins,site-per-process",
                     ],
+                    ignore_default_args=["--enable-automation"],
                 )
                 self.available = True
                 return True
@@ -229,6 +279,12 @@ class BrowserEngine:
                 while time.monotonic() < deadline and rounds < 40:
                     rounds += 1
                     await _settle(page)
+                    if not await _pass_cloudflare(page, result):
+                        result.log("error", "Cloudflare challenge not solved", page.url)
+                        return result.fail(
+                            "blocked by Cloudflare — the host IP is likely "
+                            "flagged; try FLARESOLVERR_URL or a residential proxy"
+                        )
                     current = page.url
                     if current not in seen:
                         seen.append(current)

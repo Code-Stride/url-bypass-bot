@@ -40,7 +40,8 @@ HTTP_TIMEOUT = _int("HTTP_TIMEOUT", 25)
 
 # Browser engine (the accurate path).
 USE_BROWSER = _bool("USE_BROWSER", True)
-BROWSER_HEADLESS = _bool("BROWSER_HEADLESS", True)
+# Headful under Xvfb beats Cloudflare's managed challenge; headless does not.
+BROWSER_HEADLESS = _bool("BROWSER_HEADLESS", False)
 # Max seconds the browser will spend on a single link.
 BROWSER_TIMEOUT = _int("BROWSER_TIMEOUT", 150)
 # How many browser resolutions may run at once (each costs ~250MB RAM).
