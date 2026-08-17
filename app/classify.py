@@ -111,6 +111,21 @@ INTERSTITIAL_HINT_RE = re.compile(
 )
 
 
+# WordPress pagination / archive noise on ad blogs: /page/2/, ?paged=3, …
+PAGINATION_RE = re.compile(
+    r"(?:/page/\d+/?$|[?&]paged?=\d+|/category/|/tag/|/author/|/feed/?$)",
+    re.IGNORECASE,
+)
+
+
+def is_pagination(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return False
+    return bool(PAGINATION_RE.search(p.path + ("?" + p.query if p.query else "")))
+
+
 def host_of(url: str) -> str:
     """Registrable-ish hostname, lowercase, without a leading www."""
     try:
@@ -150,12 +165,22 @@ def known_destination_score(url: str) -> int | None:
     return None
 
 
-def verdict(url: str, origin_host: str = "") -> tuple[bool, float, str]:
+def verdict(
+    url: str,
+    origin_host: str = "",
+    visited_hosts: set[str] | None = None,
+) -> tuple[bool, float, str]:
     """
     Judge a candidate destination.
 
     Returns (acceptable, confidence 0..1, reason).  `acceptable` False means
     never show this to the user as the answer.
+
+    `visited_hosts` are hosts the flow merely passed *through* (ad blogs,
+    interstitials).  A gate you walked through is never the prize — this is
+    what stops "gplinks -> skrresults.com/page/2/" being reported as an
+    answer.  A genuinely known file host still wins, in case a shortener
+    legitimately lands on one mid-chain.
     """
     if not url or not url.startswith(("http://", "https://")):
         return False, 0.0, "not an http url"
@@ -165,6 +190,12 @@ def verdict(url: str, origin_host: str = "") -> tuple[bool, float, str]:
         return False, 0.0, "no host"
     if origin_host and (host == origin_host or host.endswith("." + origin_host)):
         return False, 0.0, "same host as the shortener"
+    if is_pagination(url):
+        return False, 0.0, "pagination/archive link, not a destination"
+    if visited_hosts and known_destination_score(url) is None:
+        for vh in visited_hosts:
+            if vh and (host == vh or host.endswith("." + vh)):
+                return False, 0.05, "interstitial host we passed through"
     if is_error_url(url):
         return False, 0.0, "shortener error page"
     if is_noise(url):
@@ -193,11 +224,15 @@ def verdict(url: str, origin_host: str = "") -> tuple[bool, float, str]:
     return False, 0.1, "bare domain, no path — looks like an ad interstitial"
 
 
-def pick_best(urls: list[str], origin_host: str = "") -> tuple[str | None, float]:
+def pick_best(
+    urls: list[str],
+    origin_host: str = "",
+    visited_hosts: set[str] | None = None,
+) -> tuple[str | None, float]:
     """Choose the most credible destination out of several candidates."""
     scored: list[tuple[float, int, str]] = []
     for u in urls:
-        ok, conf, _ = verdict(u, origin_host)
+        ok, conf, _ = verdict(u, origin_host, visited_hosts)
         if ok:
             # Prefer shorter URLs as a tie-break (less tracking cruft).
             scored.append((conf, -len(u), u))

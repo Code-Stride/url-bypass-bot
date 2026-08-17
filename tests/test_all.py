@@ -63,6 +63,36 @@ def test_classifier() -> None:
           best == "https://devuploads.com/7h77e7ikjhxj", str(best))
 
 
+def test_live_regressions() -> None:
+    """The exact wrong answers produced against the live gplinks link."""
+    visited = {"skrresults.com"}
+
+    ok, _, why = verdict("https://skrresults.com/page/2/", "gplinks.co", visited)
+    check("wordpress pagination rejected", not ok, why)
+
+    ok, _, why = verdict("https://skrresults.com/some-article/", "gplinks.co", visited)
+    check("interstitial host we walked through rejected", not ok, why)
+
+    # …but a real file host reached mid-chain is still accepted.
+    ok, conf, _ = verdict(
+        "https://devuploads.com/7h77e7ikjhxj", "gplinks.co", visited
+    )
+    check("true destination still accepted", ok and conf >= 0.9, str(conf))
+
+    best, _ = pick_best(
+        ["https://skrresults.com/page/2/", "https://skrresults.com/x/",
+         "https://devuploads.com/7h77e7ikjhxj"],
+        "gplinks.co", visited,
+    )
+    check("pick_best skips interstitial pages",
+          best == "https://devuploads.com/7h77e7ikjhxj", str(best))
+
+    from app.engines.browser import AVOID_TEXT_RE
+    check("'next' is not clicked", bool(AVOID_TEXT_RE.match("Next")))
+    check("'Continue' is still clicked", not AVOID_TEXT_RE.match("Continue"))
+    check("'Get Link' is still clicked", not AVOID_TEXT_RE.match("Get Link"))
+
+
 def test_result_model() -> None:
     r = Result(input="u")
     r.log("navigate", "x")
@@ -94,6 +124,7 @@ def main() -> int:
     srv, port = mock_shortener.start()
     try:
         test_classifier()
+        test_live_regressions()
         test_result_model()
         test_http_engine(port)
         test_no_false_positive(port)

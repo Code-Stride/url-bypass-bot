@@ -33,6 +33,7 @@ from app.classify import (
     host_of,
     is_error_url,
     is_noise,
+    is_pagination,
     is_shortener,
     verdict,
 )
@@ -41,10 +42,18 @@ from app.models import Result
 # Buttons/links that advance a shortener flow, best candidates first.
 CLICK_TEXTS = [
     "get link", "getlink", "get your link", "click here to continue",
-    "continue to destination", "continue", "proceed", "next step", "next",
+    "continue to destination", "continue", "proceed", "next step",
     "verify", "i am not a robot", "unlock", "generate link", "go to link",
     "download now", "download", "skip ad", "skip", "open link",
 ]
+
+# Never click these — WordPress pagination/navigation on ad blogs, which is
+# how a previous run wandered into skrresults.com/page/2/ and called it done.
+AVOID_TEXT_RE = re.compile(
+    r"^\s*(?:next|prev(?:ious)?|older|newer|page\s*\d+|\d+|home|menu|"
+    r"privacy|terms|contact|about|dmca|disclaimer|search)\s*(?:posts?|page)?\s*$",
+    re.IGNORECASE,
+)
 
 # Selectors tried before text matching (AdLinkFly + common clones).
 CLICK_SELECTORS = [
@@ -167,9 +176,20 @@ class BrowserEngine:
             for role in ("button", "link"):
                 try:
                     el = page.get_by_role(role, name=re.compile(text, re.I)).first
-                    if await el.count() and await el.is_visible():
-                        await el.click(timeout=4000, no_wait_after=True)
-                        return f"{role} '{text}'"
+                    if not (await el.count() and await el.is_visible()):
+                        continue
+                    label = ((await el.inner_text()) or "").strip()
+                    if AVOID_TEXT_RE.match(label):
+                        continue
+                    href = ""
+                    try:
+                        href = (await el.get_attribute("href")) or ""
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if href and is_pagination(href):
+                        continue
+                    await el.click(timeout=4000, no_wait_after=True)
+                    return f"{role} '{label or text}'"
                 except Exception:  # noqa: BLE001
                     continue
         # Last resort: a submit button of any form.
@@ -199,6 +219,7 @@ class BrowserEngine:
             context.on("page", lambda p: asyncio.ensure_future(_close_quietly(p, page)))
 
             seen: list[str] = []
+            visited: set[str] = {origin_host}
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 result.log("navigate", "opened link", url)
@@ -214,7 +235,7 @@ class BrowserEngine:
                         result.log("navigate", f"page {rounds}", current)
 
                     # Reached a credible destination?
-                    ok, conf, why = verdict(current, origin_host)
+                    ok, conf, why = verdict(current, origin_host, visited)
                     if ok and conf >= 0.6 and not is_shortener(current):
                         result.candidates.append(current)
                         result.log("redirect", f"destination reached ({why})", current)
@@ -223,6 +244,9 @@ class BrowserEngine:
                     if is_error_url(current):
                         result.log("error", "shortener returned an error page", current)
                         return result.fail("shortener refused: " + current)
+
+                    # Not a destination => it is a gate we are passing through.
+                    visited.add(host_of(current))
 
                     body = ""
                     try:
@@ -252,7 +276,7 @@ class BrowserEngine:
                         continue
 
                     # Nothing to click: harvest links and follow the best one.
-                    cand = await self._harvest(page, origin_host)
+                    cand = await self._harvest(page, origin_host, visited)
                     if cand:
                         result.candidates.extend(cand)
                         best = cand[0]
@@ -285,7 +309,7 @@ class BrowserEngine:
                 # Budget spent — fall back to the best candidate we saw.
                 from app.classify import pick_best
 
-                best, conf = pick_best(result.candidates, origin_host)
+                best, conf = pick_best(result.candidates, origin_host, visited)
                 if best:
                     return result.succeed(best, "browser(partial)", min(conf, 0.7))
                 return result.fail("could not reach a destination in time")
@@ -300,7 +324,9 @@ class BrowserEngine:
                     pass
 
     @staticmethod
-    async def _harvest(page, origin_host: str) -> list[str]:
+    async def _harvest(
+        page, origin_host: str, visited: set[str] | None = None
+    ) -> list[str]:
         """Collect plausible destinations embedded in the page."""
         try:
             hrefs = await page.eval_on_selector_all(
@@ -310,7 +336,7 @@ class BrowserEngine:
             hrefs = []
         out: list[tuple[float, str]] = []
         for h in hrefs:
-            ok, conf, _ = verdict(h, origin_host)
+            ok, conf, _ = verdict(h, origin_host, visited)
             if ok and conf >= 0.6 and not is_noise(h):
                 out.append((conf, h))
         out.sort(reverse=True)
