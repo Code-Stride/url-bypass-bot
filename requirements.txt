@@ -1,9 +1,10 @@
-python-telegram-bot>=21.0
-requests>=2.31
-# Cloudflare handling: real Chrome TLS/HTTP2 fingerprint (clears most
-# managed "v3" challenges) + legacy JS-challenge solver.
-curl_cffi>=0.7
-cloudscraper>=1.2.71
-# Web UI + JSON API (served together with the bot from one port).
+# web + api
 fastapi>=0.115
 uvicorn[standard]>=0.30
+# telegram
+python-telegram-bot>=21.0
+# http engines
+requests>=2.32
+curl_cffi>=0.7
+# browser engine (the accurate path)
+playwright>=1.47

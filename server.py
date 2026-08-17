@@ -1,15 +1,7 @@
 """
-server.py — single entrypoint for Railway.
+Entrypoint: web UI + JSON API + Telegram bot on one port.
 
-Serves the web UI + JSON API, and runs the Telegram bot in the same process
-(webhook mode when a public URL is available, polling otherwise).
-
-    python server.py            # binds 0.0.0.0:$PORT (default 8080)
-
-Env:
-    BOT_TOKEN     Telegram token; omit to run web-only
-    ENABLE_BOT=0  force web-only even when BOT_TOKEN is set
-    PORT          injected by Railway
+    python server.py        # binds 0.0.0.0:$PORT (default 8080)
 """
 
 from __future__ import annotations
@@ -21,19 +13,20 @@ import uvicorn
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
 )
 
 
 def main() -> None:
-    port = int(os.environ.get("PORT", "8080"))
+    from app import config
+
     uvicorn.run(
-        "webapp:app",
+        "app.web.api:app",
         host="0.0.0.0",
-        port=port,
-        log_level=os.environ.get("LOG_LEVEL", "info"),
+        port=config.PORT,
         proxy_headers=True,
         forwarded_allow_ips="*",
+        timeout_keep_alive=75,
     )
 
 
