@@ -121,6 +121,19 @@ async def api_bypass_post(request: Request):
     return JSONResponse(await _resolve(str(body.get("url", ""))))
 
 
+@app.get("/api/trace")
+async def api_trace(url: str = ""):
+    """Diagnostic: show every hop of the chain (status, cookies, form fields)."""
+    url = (url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url'.")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    from trace_chain import trace
+
+    return JSONResponse(await asyncio.to_thread(trace, url))
+
+
 @app.post("/telegram/{token}")
 async def telegram_webhook(token: str, request: Request):
     if not ENABLE_BOT or _tg_app is None or token != BOT_TOKEN:
