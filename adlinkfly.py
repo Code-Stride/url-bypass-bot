@@ -238,6 +238,16 @@ def interstitial_targets(
     ]
 
 
+_ERROR_URL_RE = re.compile(
+    r"/(?:link-error|error)\b|error_code=", re.IGNORECASE
+)
+
+
+def _is_error_url(url: str) -> bool:
+    """gplinks answers refusals with a 200 + a link-error URL."""
+    return bool(_ERROR_URL_RE.search(url or ""))
+
+
 def _post_links_go(
     client: Client, origin: str, fields: dict[str, str], referer: str
 ) -> str | None:
@@ -262,15 +272,57 @@ def _post_links_go(
             url = data.get("url") or data.get("link") or data.get("data")
             if isinstance(url, dict):
                 url = url.get("url")
-            if url and str(url).startswith("http"):
+            if url and str(url).startswith("http") and not _is_error_url(str(url)):
                 return str(url)
         except (ValueError, AttributeError):
             m = _JSON_URL_RE.search(body)
             if m:
                 cand = m.group(1).replace("\\/", "/")
-                if cand.startswith("http"):
+                if cand.startswith("http") and not _is_error_url(cand):
                     return cand
     return None
+
+
+def _complete_ad_steps(
+    client: Client, blog_url: str, cookies: dict[str, str]
+) -> None:
+    """
+    Satisfy the shortener's "you must view N ad pages" counter.
+
+    The ad blog tracks progress in the `step_count` / `imps` cookies and
+    reports each view by POSTing an `ads-track-data` form back to itself.
+    Skipping this makes /links/go answer `error_code=not_enough_steps`, so we
+    walk the counter up to `pages` without actually rendering the ads.
+    """
+    try:
+        pages = int(cookies.get("pages") or 0)
+    except ValueError:
+        pages = 0
+    if pages <= 0:
+        return
+    pages = min(pages, 10)  # sanity cap
+    vid = cookies.get("vid", "")
+
+    for step in range(1, pages + 1):
+        # The counters live in cookies, so bump them client-side…
+        client.cookies["step_count"] = str(step)
+        client.cookies["imps"] = str(step)
+        # …and report the view, which is what the server-side counter reads.
+        client.post(
+            blog_url,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "form_name": "ads-track-data",
+                "step_id": str(step),
+                "ad_impressions": str(step),
+                "visitor_id": vid,
+                "next_target": blog_url,
+            },
+            referer=blog_url,
+        )
+
+    client.cookies["step_count"] = str(pages)
+    client.cookies["imps"] = str(pages)
 
 
 def _unlock_page(
@@ -346,6 +398,10 @@ def bypass(url: str, client: Client | None = None, _depth: int = 0) -> str | Non
                 rebuilt = interstitial_targets(
                     blog_url, client.cookies, parsed.netloc, scheme
                 )
+                if rebuilt:
+                    # Walk the ad-step counter, else /links/go replies
+                    # error_code=not_enough_steps.
+                    _complete_ad_steps(client, blog_url, client.cookies)
                 if not rebuilt and blog is not None:
                     # Ad blog running AdLinkFly itself? Unlock it in place.
                     if looks_like_adlinkfly(blog.text):

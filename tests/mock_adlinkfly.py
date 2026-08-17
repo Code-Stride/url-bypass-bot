@@ -157,6 +157,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         u = urlparse(self.path)
+        if u.path.startswith("/blog"):
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            self.rfile.read(length)
+            self._send(200, "<html>step recorded</html>")
+            return
         if u.path != "/links/go":
             self._send(404, "nope")
             return
@@ -171,6 +176,28 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"status": "error", "message": "bad token"}),
                        ctype="application/json")
             return
+        # Live gplinks refuses until the ad steps have been walked.
+        cookies = dict(
+            c.strip().split("=", 1)
+            for c in self.headers.get("Cookie", "").split(";")
+            if "=" in c
+        )
+        if "pages" in cookies:
+            try:
+                pages = int(cookies.get("pages", "0"))
+                done = int(cookies.get("step_count", "0"))
+            except ValueError:
+                pages, done = 0, 0
+            if done < pages:
+                self._send(
+                    200,
+                    json.dumps({
+                        "status": "error",
+                        "url": "https://gplinks.com/link-error?error_code=not_enough_steps",
+                    }),
+                    ctype="application/json",
+                )
+                return
         self._send(
             200,
             json.dumps({"status": "success", "url": DESTINATION}),
